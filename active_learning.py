@@ -47,8 +47,8 @@ def active_learning_loop(model, train_x_mt, train_y_mt, problem, acq_method, max
                             outcome_transform=None)
         mt_mll = ExactMarginalLogLikelihood(model.likelihood, model)
 
+        '''
         warnings.filterwarnings("error", category=OptimizationWarning)
-        
         try:
             fit_gpytorch_mll(mt_mll, method='L-BFGS-B')
             # fit_gpytorch_mll(mt_mll, optimizer=fit_gpytorch_mll_torch, optimizer_kwargs={"optimizer":torch.optim.Adam})
@@ -56,6 +56,7 @@ def active_learning_loop(model, train_x_mt, train_y_mt, problem, acq_method, max
         except OptimizationWarning:
             if disp:
                 print("GP fitting failed. Retrying using Adam...")
+                # print("Hyperparameter optimization failure")
             fit_gpytorch_mll(mt_mll, optimizer=fit_gpytorch_mll_torch, optimizer_kwargs={"optimizer":torch.optim.Adam})
 
         # except OptimizationWarning:
@@ -67,6 +68,9 @@ def active_learning_loop(model, train_x_mt, train_y_mt, problem, acq_method, max
         #     fit_gpytorch_mll(mt_mll, optimizer=fit_gpytorch_mll_torch, optimizer_kwargs={"optimizer":torch.optim.Adam})
 
         warnings.filterwarnings("default")
+        '''
+
+        fit_gpytorch_mll(mt_mll)
 
         if log_hyperparams:
             os.makedirs('log', exist_ok=True)
@@ -146,6 +150,7 @@ def convergence_dist(u_candidate, truth):
 
 def update_history_list(dist_history, input_list, model, problem, truth=torch.tensor([8.89897949, 11.89897949]), npts=100, ):
     bounds = problem.bounds
+    dim = bounds.size(1)
     
     for input_vec in input_list:
         assert(input_vec.size(0)==dim-2)
