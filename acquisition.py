@@ -23,7 +23,7 @@ def entropy(x, model):
     norm = Normal(0.,1.)
     return -norm.cdf(z(x,model))*torch.log(torch.maximum(torch.tensor(0.01),norm.cdf(z(x,model)))) - norm.cdf(1.0-z(x,model))*torch.log(1.01-torch.maximum(torch.tensor(0.01),norm.cdf(z(x,model))))
 
-    
+
 
 # Entropy search - maximize value of entropy
 # Renamed to optimize acquisition for more general operation with any objective
@@ -205,5 +205,9 @@ def multitask_acquisition(acqf):
     return func
 
 # def joint_acquisition(model, problem, acqf, disp=False):
-    
-    
+
+def _get_acq_func(method_name):
+    if method_name == 'entropy':
+        return multitask_acquisition(entropy)
+    else:
+        raise ValueError("Acquisition function '" + method_name + "' undefined.")

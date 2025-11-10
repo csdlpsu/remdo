@@ -11,12 +11,21 @@ from scipy.optimize import minimize, Bounds
 from scipy.stats import qmc
 import numpy as np
 import os
+from acquisition import _get_acq_func
 
 def active_learning_loop(model, train_x_mt, train_y_mt, problem, acq_method, maxiters=20, disp=True, save_hist=None, log_hyperparams=False):
     task_list = problem.tasks
     bounds = problem.bounds
     bounds_task = torch.column_stack([bounds, torch.tensor(task_list)])
     dim = bounds.size(1)
+
+    # Select acquisition function
+    if type(acq_method) == str:
+        acq_func = _get_acq_func(acq_method)
+    elif callable(acq_method):
+        acq_func = acq_method
+    else:
+        raise TypeError("acq_method must be type str or callable.")
 
     if save_hist is not None:
         # save history
@@ -28,7 +37,7 @@ def active_learning_loop(model, train_x_mt, train_y_mt, problem, acq_method, max
         update_history_list(dist_history, input_list, model, problem)
 
     for i in range(maxiters):
-        new_x = acq_method(model, problem)
+        new_x = acq_func(model, problem)
         problem.set_vars(new_x)
         # Dependent on implementation of problem.res, TODO look into this
         new_y = torch.diagonal(problem.res).reshape(-1,1)
@@ -55,9 +64,9 @@ def active_learning_loop(model, train_x_mt, train_y_mt, problem, acq_method, max
 
         except OptimizationWarning:
             if disp:
-                print("GP fitting failed. Retrying using Adam...")
+                print("GP fitting failed. Retrying using SGD...")
                 # print("Hyperparameter optimization failure")
-            fit_gpytorch_mll(mt_mll, optimizer=fit_gpytorch_mll_torch, optimizer_kwargs={"optimizer":torch.optim.Adam})
+            fit_gpytorch_mll(mt_mll, optimizer=fit_gpytorch_mll_torch, optimizer_kwargs={"optimizer":torch.optim.SGD})
 
         # except OptimizationWarning:
         #     if disp:
@@ -93,7 +102,10 @@ def active_learning_loop(model, train_x_mt, train_y_mt, problem, acq_method, max
             }
         torch.save(hist, filename)
 
-    return model, train_x_mt, train_y_mt
+    return {'model':model, 
+            'problem':problem,
+            'train_x':train_x_mt, 
+            'train_y':train_y_mt}
 
 
 
