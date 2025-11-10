@@ -1,13 +1,18 @@
 import torch
-from botorch.models.multitask import MultiTaskGP
+import warnings
 from gpytorch.mlls import ExactMarginalLogLikelihood
+from botorch.models.multitask import MultiTaskGP
 from botorch.fit import fit_gpytorch_mll
 from botorch.models.transforms import Normalize
 from botorch.utils.transforms import normalize, unnormalize
+from botorch.exceptions.warnings import OptimizationWarning
+from botorch.optim.fit import fit_gpytorch_mll_torch
 from scipy.optimize import minimize, Bounds
+from scipy.stats import qmc
 import numpy as np
+import os
 
-def active_learning_loop(model, train_x_mt, train_y_mt, problem, acq_method, maxiters=20, disp=True, save_hist = None):
+def active_learning_loop(model, train_x_mt, train_y_mt, problem, acq_method, maxiters=20, disp=True, save_hist=None, log_hyperparams=False):
     task_list = problem.tasks
     bounds = problem.bounds
     bounds_task = torch.column_stack([bounds, torch.tensor(task_list)])
@@ -20,82 +25,59 @@ def active_learning_loop(model, train_x_mt, train_y_mt, problem, acq_method, max
         num_evals = [train_y_mt.size(0)]
         dist_history = []
 
-        for input_vec in input_list:
-            assert(input_vec.size(0)==dim-2)
-            # Truth is currently hardcoded, but should be computed using OpenMDAO or similar
-            # truth = from_OpenMDAO(input_vec)
-            truth = torch.tensor([8.89897949, 11.89897949])
+        update_history_list(dist_history, input_list, model, problem)
 
-            npts = 40
-            xvec, yvec = torch.meshgrid(torch.linspace(*bounds[:,-2], npts), 
-                                        torch.linspace(*bounds[:,-1], npts), 
-                                        indexing="ij")
-            test_x = torch.column_stack([input_vec.repeat(npts**2,1),
-                                         xvec.reshape(-1,1),
-                                         yvec.reshape(-1,1)])
-            test_x_normalized = normalize(test_x, bounds)
-            input_vec_normalized = normalize(input_vec, bounds[:,:dim-2])
-            
-            x_candidate = residual_intersection(test_x_normalized, model, bounds, input_vec_normalized)
-            u_candidate = x_candidate[-2:] # unnormalized intersection point
-
-            dist_history.append(convergence_dist(u_candidate, truth).numpy().item())
-        
-    
     for i in range(maxiters):
         new_x = acq_method(model, problem)
         problem.set_vars(new_x)
+        # Dependent on implementation of problem.res, TODO look into this
         new_y = torch.diagonal(problem.res).reshape(-1,1)
                 
         if disp:
             print(f"Iter {i+1}")
-    
-        # new_x_task = torch.column_stack([new_x.repeat(2,1), torch.tensor([0, 1])])
+
+        # Append new training points to training tensor
         new_x_task = torch.column_stack([new_x, torch.tensor(task_list)])
-        
         train_x_mt = torch.vstack((train_x_mt, new_x_task))
         train_y_mt = torch.vstack((train_y_mt, new_y))
-    
-        try:
-            model = MultiTaskGP(train_x_mt,train_y_mt,task_feature=-1,
-                                   input_transform=Normalize(d=dim+1,bounds=bounds_task,indices=list(range(0,dim))),
-                                   outcome_transform=None)
-            mt_mll = ExactMarginalLogLikelihood(model.likelihood, model)
-            fit_gpytorch_mll(mt_mll);
-            num_evals.append(num_evals[-1]+len(task_list))
 
-            # hyperparams = mt_model.state_dict()
-            # torch.save(hyperparams, 'hyperparams.pt')
-        except:
-            print('error')
-            break
-            # print('GP fitting failed, using previous hyperparameters')
-            # # mt_model= MultiTaskGP(train_x_mt,train_y_mt,task_feature=-1)
-            # mt_model= MultiTaskGP(train_x_mt,train_y_mt,task_feature=-1,input_transform=Normalize(d=6),outcome_transform=None)
-            # params = torch.load('hyperparams.pt')
-            # mt_model.load_state_dict(params)
+                    
+        model = MultiTaskGP(train_x_mt,train_y_mt,task_feature=-1,
+                            input_transform=Normalize(d=dim+1,bounds=bounds_task,indices=list(range(0,dim))),
+                            outcome_transform=None)
+        mt_mll = ExactMarginalLogLikelihood(model.likelihood, model)
+
+        warnings.filterwarnings("error", category=OptimizationWarning)
         
-        if save_hist is not None:
-            for input_vec in input_list:
-                assert(input_vec.size(0)==dim-2)
-                # Truth is currently hardcoded, but should be computed using OpenMDAO or similar
-                # truth = from_OpenMDAO(input_vec)
-                truth = torch.tensor([8.89897949, 11.89897949])
+        try:
+            fit_gpytorch_mll(mt_mll, method='L-BFGS-B')
+            # fit_gpytorch_mll(mt_mll, optimizer=fit_gpytorch_mll_torch, optimizer_kwargs={"optimizer":torch.optim.Adam})
 
-                npts = 40
-                xvec, yvec = torch.meshgrid(torch.linspace(*bounds[:,-2], npts), 
-                                            torch.linspace(*bounds[:,-1], npts), 
-                                            indexing="ij")
-                test_x = torch.column_stack([input_vec.repeat(npts**2,1),
-                                             xvec.reshape(-1,1),
-                                             yvec.reshape(-1,1)])
-                test_x_normalized = normalize(test_x, bounds)
-                input_vec_normalized = normalize(input_vec, bounds[:,:dim-2])
-                
-                x_candidate = residual_intersection(test_x_normalized, model, bounds, input_vec_normalized)
-                u_candidate = x_candidate[-2:]
-            
-                dist_history.append(convergence_dist(u_candidate, truth).numpy().item())
+        except OptimizationWarning:
+            if disp:
+                print("GP fitting failed. Retrying using Adam...")
+            fit_gpytorch_mll(mt_mll, optimizer=fit_gpytorch_mll_torch, optimizer_kwargs={"optimizer":torch.optim.Adam})
+
+        # except OptimizationWarning:
+        #     if disp:
+        #         print("GP fitting failed. Retrying using previous hyperparameters...")
+        #     hyperparams = torch.load('hyperparams.pt')
+        #     model.load_state_dict(hyperparams)
+        #     mt_mll = ExactMarginalLogLikelihood(model.likelihood, model)
+        #     fit_gpytorch_mll(mt_mll, optimizer=fit_gpytorch_mll_torch, optimizer_kwargs={"optimizer":torch.optim.Adam})
+
+        warnings.filterwarnings("default")
+
+        if log_hyperparams:
+            os.makedirs('log', exist_ok=True)
+            hyperparams = model.state_dict()
+            torch.save(hyperparams, 'log/hyperparams_iter' + str(i+1) + '.pt')
+
+        # Increment evaluation counter. TODO maybe move this closer to where it happens
+        num_evals.append(num_evals[-1]+len(task_list))
+
+        if save_hist is not None:
+            update_history_list(dist_history, input_list, model, problem)
     
     if disp:
         print('done')  
@@ -108,6 +90,11 @@ def active_learning_loop(model, train_x_mt, train_y_mt, problem, acq_method, max
         torch.save(hist, filename)
 
     return model, train_x_mt, train_y_mt
+
+
+
+
+    
 
 # Track convergence history
 def convergence_obj(x, model):
@@ -157,4 +144,23 @@ def residual_intersection(x, model, bounds, specify_input = None):
 def convergence_dist(u_candidate, truth):
     return torch.sum((u_candidate - truth)**2)**0.5
 
-# def track_history(input_vec, model, problem):
+def update_history_list(dist_history, input_list, model, problem, truth=torch.tensor([8.89897949, 11.89897949]), npts=100, ):
+    bounds = problem.bounds
+    
+    for input_vec in input_list:
+        assert(input_vec.size(0)==dim-2)
+        # Truth is currently hardcoded, but should be computed using OpenMDAO or similar
+        # truth = from_OpenMDAO(input_vec)
+        # truth = torch.tensor([8.89897949, 11.89897949])
+    
+        sampler = qmc.LatinHypercube(d=2)
+        test_x = torch.column_stack([input_vec.repeat(npts,1),
+                                     torch.tensor(qmc.scale(sampler.random(n=npts), bounds[0,-2:], bounds[1,-2:]))])
+        test_x_normalized = normalize(test_x, bounds)
+        
+        input_vec_normalized = normalize(input_vec, bounds[:,:dim-2])
+        
+        x_candidate = residual_intersection(test_x_normalized, model, bounds, input_vec_normalized)
+        u_candidate = x_candidate[-2:] # unnormalized intersection point
+    
+        dist_history.append(convergence_dist(u_candidate, truth).numpy().item())
