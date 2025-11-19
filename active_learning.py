@@ -5,7 +5,7 @@ from botorch.models.multitask import MultiTaskGP
 from botorch.fit import fit_gpytorch_mll
 from botorch.models.transforms import Normalize, Standardize
 from botorch.utils.transforms import normalize, unnormalize, standardize
-from botorch.exceptions.warnings import OptimizationWarning
+# from botorch.exceptions.warnings import OptimizationWarning
 from botorch.optim.fit import fit_gpytorch_mll_torch
 from scipy.optimize import minimize, Bounds
 from scipy.stats import qmc
@@ -15,6 +15,7 @@ from acquisition import _get_acq_func
 
 # def active_learning_loop(model, train_x_mt, train_y_mt, problem, acq_method, maxiters=20, disp=True, save_hist=None, log_hyperparams=False):
 def active_learning_loop(trained_gp, acq_method, maxiters=20, disp=True, save_hist: tuple[torch.Tensor, str] = None, log_hyperparams=False):
+    # unpack results structure
     model = trained_gp.model
     train_x = trained_gp.train_x
     train_y = trained_gp.train_y
@@ -35,19 +36,22 @@ def active_learning_loop(trained_gp, acq_method, maxiters=20, disp=True, save_hi
     else:
         raise TypeError("acq_method must be type str or callable.")
 
+    # Save to log files
     if save_hist is not None:
-        # save history
+        # Check input type for list/tensor
         if type(save_hist) == torch.Tensor:
             input_list = save_hist[0].reshape(-1,input_dim)
         else:
             input_list = torch.tensor(save_hist[0]).reshape(-1,input_dim)
+        # Storage variables
         truth_list = torch.empty(0,coupling_dim)
         filename = save_hist[1]
         num_evals = [train_y.size(0)]
         dist_history = []
 
+        # Run OpenMDAO problem from test function
         for input_vec in input_list:
-            assert(input_vec.size(0)==dim-2)
+            assert(input_vec.size(0)==input_dim)
             truth_list = torch.vstack((truth_list, problem.fromOpenMDAO(input_vec)))
 
         update_history_list(dist_history, trained_gp, input_list, truth_list)
@@ -55,7 +59,10 @@ def active_learning_loop(trained_gp, acq_method, maxiters=20, disp=True, save_hi
     for i in range(maxiters):
         new_x = acq_func(model, problem)
         problem.set_vars(new_x)
-        # Dependent on implementation of problem.res, TODO look into this
+        # TODO:
+        # Currently this calculates all residuals for all new x points. 
+        # This results in extra evaluations.
+        # Fine for now since the function is inexpensive, but needs to be looked at in the future.
         new_y = torch.diagonal(problem.res).reshape(-1,1)
                 
         if disp:
@@ -66,34 +73,11 @@ def active_learning_loop(trained_gp, acq_method, maxiters=20, disp=True, save_hi
         train_x = torch.vstack((train_x, new_x_task))
         train_y = torch.vstack((train_y, new_y))
 
-                    
+        # Train GP
         model = MultiTaskGP(train_x,train_y,task_feature=-1,
                             input_transform=Normalize(d=dim+1,bounds=bounds_task,indices=list(range(0,dim))),
                             outcome_transform=Standardize(m=1))
         mt_mll = ExactMarginalLogLikelihood(model.likelihood, model)
-
-        '''
-        warnings.filterwarnings("error", category=OptimizationWarning)
-        try:
-            fit_gpytorch_mll(mt_mll, method='L-BFGS-B')
-            # fit_gpytorch_mll(mt_mll, optimizer=fit_gpytorch_mll_torch, optimizer_kwargs={"optimizer":torch.optim.Adam})
-
-        except OptimizationWarning:
-            if disp:
-                print("GP fitting failed. Retrying using SGD...")
-                # print("Hyperparameter optimization failure")
-            fit_gpytorch_mll(mt_mll, optimizer=fit_gpytorch_mll_torch, optimizer_kwargs={"optimizer":torch.optim.SGD})
-
-        # except OptimizationWarning:
-        #     if disp:
-        #         print("GP fitting failed. Retrying using previous hyperparameters...")
-        #     hyperparams = torch.load('hyperparams.pt')
-        #     model.load_state_dict(hyperparams)
-        #     mt_mll = ExactMarginalLogLikelihood(model.likelihood, model)
-        #     fit_gpytorch_mll(mt_mll, optimizer=fit_gpytorch_mll_torch, optimizer_kwargs={"optimizer":torch.optim.Adam})
-
-        warnings.filterwarnings("default")
-        '''
 
         fit_gpytorch_mll(mt_mll)
 
