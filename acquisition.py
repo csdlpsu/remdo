@@ -3,6 +3,7 @@ import torch
 from scipy.optimize import minimize, Bounds
 from torch.distributions import Normal
 from botorch.utils.transforms import normalize, unnormalize
+from utils import sample_in_bounds
 
 from utils import func_grad, func_scipy
 
@@ -37,36 +38,33 @@ def entropy(x, model):
 # Outputs:
 #     1 x d un-normalized tensor of input that results in max acquisition value
 #     
-def optimize_acquisition(model, problem, task_no, acqf, num_samples=1000, specify_input=None):
+def optimize_acquisition(model, problem, task_no, acqf, num_samples = 1000, specify_input: list = None):
     bounds = problem.bounds
-    # Normalize bounds and x0
     d = bounds.size(1)
-    bounds_scaled = torch.tensor([0.,1.]).reshape(-1,1).repeat(1,d)
-        
-    # If specified, set design vars
-    if specify_input is not None:
-        input_length = torch.tensor(specify_input).size(1)
-        bounds_scaled[:,:input_length] = normalize(torch.tensor(specify_input), 
-                                                   bounds[:,:input_length])
 
-    # Generate N random samples within NORMALIZED bounds
-    X_samples = torch.tensor(np.random.uniform(low=bounds_scaled[0,:],
-                                               high=bounds_scaled[1,:],
-                                               size=(num_samples,d)))
+    # Generate sample points
+    Xn_samples = normalize( sample_in_bounds(bounds, num_samples, specify_input), bounds)
     
     # Add task id
-    X_samples_task = torch.column_stack([X_samples, torch.ones(num_samples,1)*task_no])
+    Xn_samples_task = torch.column_stack([Xn_samples, torch.ones(num_samples,1)*task_no])
 
-    # Find index of X sample with highest value of acquisition function
-    sample_max_acquisition_index = torch.argmax(acqf(X_samples_task, model))
+    # Find index of X sample with highest value of acquisition function and use as x0
+    sample_max_acquisition_index = torch.argmax(acqf(Xn_samples_task, model))
+    x0 = Xn_samples[sample_max_acquisition_index]
 
-    # Use max sample as x0
-    x0 = X_samples[sample_max_acquisition_index]
-    # x0 = torch.tensor([0.4,0.4,0.4,0.4,0.4,8.0,10.0],dtype=torch.float64)
-
+    # Set normalized bounds for scipy.optimize.minimize
+    bounds_norm = torch.tensor([0.,1.]).reshape(-1,1).repeat(1,d)
+    # If specified, set the design vars in both bounds.
+    if specify_input is not None:
+        # normalize input
+        input_len = len(specify_input)
+        input_norm = normalize(torch.tensor(speciy_input), bounds[:,0:input_len])
+        
+        bounds_norm[:,0:len(specify_input)] = input_norm
+    
     # Append task ID to bounds and convert to scipy format
-    bounds_scaled_task = torch.column_stack([bounds_scaled, torch.tensor([task_no, task_no])])
-    bounds_scaled_scipy = Bounds(bounds_scaled_task[0,:], bounds_scaled_task[1,:])
+    bounds_norm_task = torch.column_stack([bounds_norm, torch.tensor([task_no, task_no])])
+    bounds_norm_task_scipy = Bounds(bounds_norm_task[0,:], bounds_norm_task[1,:])
 
     def neg_acqf(x, model):
         return -func_scipy(acqf)(x, model)
@@ -75,16 +73,14 @@ def optimize_acquisition(model, problem, task_no, acqf, num_samples=1000, specif
         return -func_scipy(func_grad(acqf))(x, model)
 
     res = minimize(neg_acqf, torch.cat((x0,torch.tensor([task_no]))),
-                   method='SLSQP', 
+                   method='L-BFGS-B', 
                    args=model, 
                    jac=neg_acqf_grad,
                    # options={'xatol': 1e-8, 'disp': True}, 
                    options={'ftol': 1e-8},
-                   bounds=bounds_scaled_scipy)
+                   bounds=bounds_norm_task_scipy)
 
     return unnormalize(torch.tensor(res.x)[:-1],bounds), -torch.tensor(res.fun)
-
-    
 
 # # Sequence acquisition function optimization for multiple tasks
 # # Also handles results visualization
@@ -144,15 +140,15 @@ def optimize_acquisition(model, problem, task_no, acqf, num_samples=1000, specif
         
 #     return X_maximizer
 
-# Sequence acquisition function optimization for multiple tasks
-# Also handles results visualization
+'''
+# Converts single-task acquisition function into multi-task by sequencing the original function for each task.
+# Returns a new function.
+# Also handles results visualization for now
 # Inputs: 
-#     model      | botorch model
-#     task_list  | list of t task numbers for which to find entropy
-#     bounds     | 2 x d bounds tensor; first row is low, second row is high
-#                | where d is the number of dimensions. NO TASK INDICATOR
+#     acqf   | original acquisition function callable.
 # Outputs:
-#     X_max_ent  | t x d tensor of sample points with highest entropy. NO TASK INDICATOR
+#     func   | multitask acquisition function callable.
+'''
 def multitask_acquisition(acqf):
     def func(model, problem, disp=False):
         task_list = problem.tasks
@@ -169,37 +165,6 @@ def multitask_acquisition(acqf):
     
             # Add optimizer x to return list
             X_maximizer[ind,:] = x_optim
-        
-        ## PLOT RESULTS
-        # if disp:
-        #     # entropy contour
-        #     npoints = 50
-        #     xv, yv = torch.meshgrid(torch.linspace(6.,12.,npoints), torch.linspace(6.,20.,npoints))
-        #     in_vec_r1 = X_max_ent[0,:5]
-        #     xyvec_r1 = torch.column_stack([in_vec_r1.repeat(npoints**2,1),xv.reshape(-1,1),yv.reshape(-1,1)])
-        #     xyvec_r1 = normalize(xyvec_r1, bounds)
-        #     xyvec_r1 = torch.column_stack([xyvec_r1, torch.ones(npoints**2,1) * 0])
-        #     in_vec_r2 = X_max_ent[1,:5]
-        #     xyvec_r2 = torch.column_stack([in_vec_r2.repeat(npoints**2,1),xv.reshape(-1,1),yv.reshape(-1,1)])
-        #     xyvec_r2 = normalize(xyvec_r2, bounds)
-        #     xyvec_r2 = torch.column_stack([xyvec_r2, torch.ones(npoints**2,1) * 1])
-        #     r1_entropy = entropy(xyvec_r1, model)
-        #     r2_entropy = entropy(xyvec_r2, model)
-        
-        #     # Plot result at each iteration
-        #     fig = plt.figure(figsize=(12,4))
-        #     ax1 = fig.add_subplot(121)
-        #     er1 = ax1.contourf(xv,yv,r1_entropy.detach().reshape(npoints,npoints))
-        #     # ax1.scatter(X_samples[:,-2],X_samples[:,-1], c='k', s=8)
-        #     fig.colorbar(er1)
-        #     ax2 = fig.add_subplot(122)
-        #     er2 = ax2.contourf(xv,yv,r2_entropy.detach().reshape(npoints,npoints))
-        #     # ax2.scatter(X_samples[:,-2],X_samples[:,-1], c='k', s=8)
-        #     fig.colorbar(er2)
-        
-        #     ax1.scatter(X_max_ent[0,-2],X_max_ent[0,-1], c='r')
-        #     ax2.scatter(X_max_ent[1,-2],X_max_ent[1,-1], c='r')
-        #     plt.show()
             
         return X_maximizer
     return func

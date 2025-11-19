@@ -3,8 +3,8 @@ import warnings
 from gpytorch.mlls import ExactMarginalLogLikelihood
 from botorch.models.multitask import MultiTaskGP
 from botorch.fit import fit_gpytorch_mll
-from botorch.models.transforms import Normalize
-from botorch.utils.transforms import normalize, unnormalize
+from botorch.models.transforms import Normalize, Standardize
+from botorch.utils.transforms import normalize, unnormalize, standardize
 from botorch.exceptions.warnings import OptimizationWarning
 from botorch.optim.fit import fit_gpytorch_mll_torch
 from scipy.optimize import minimize, Bounds
@@ -13,11 +13,19 @@ import numpy as np
 import os
 from acquisition import _get_acq_func
 
-def active_learning_loop(model, train_x_mt, train_y_mt, problem, acq_method, maxiters=20, disp=True, save_hist=None, log_hyperparams=False):
+# def active_learning_loop(model, train_x_mt, train_y_mt, problem, acq_method, maxiters=20, disp=True, save_hist=None, log_hyperparams=False):
+def active_learning_loop(trained_gp, acq_method, maxiters=20, disp=True, save_hist: tuple[torch.Tensor, str] = None, log_hyperparams=False):
+    model = trained_gp.model
+    train_x = trained_gp.train_x
+    train_y = trained_gp.train_y
+    problem = trained_gp.problem
+    
     task_list = problem.tasks
     bounds = problem.bounds
     bounds_task = torch.column_stack([bounds, torch.tensor(task_list)])
-    dim = bounds.size(1)
+    dim = problem.dim
+    input_dim = problem.input_dim
+    coupling_dim = problem.coupling_dim
 
     # Select acquisition function
     if type(acq_method) == str:
@@ -29,12 +37,20 @@ def active_learning_loop(model, train_x_mt, train_y_mt, problem, acq_method, max
 
     if save_hist is not None:
         # save history
-        input_list = torch.tensor(save_hist[0]).reshape(-1,dim-2)
+        if type(save_hist) == torch.Tensor:
+            input_list = save_hist[0].reshape(-1,input_dim)
+        else:
+            input_list = torch.tensor(save_hist[0]).reshape(-1,input_dim)
+        truth_list = torch.empty(0,coupling_dim)
         filename = save_hist[1]
-        num_evals = [train_y_mt.size(0)]
+        num_evals = [train_y.size(0)]
         dist_history = []
 
-        update_history_list(dist_history, input_list, model, problem)
+        for input_vec in input_list:
+            assert(input_vec.size(0)==dim-2)
+            truth_list = torch.vstack((truth_list, problem.fromOpenMDAO(input_vec)))
+
+        update_history_list(dist_history, trained_gp, input_list, truth_list)
 
     for i in range(maxiters):
         new_x = acq_func(model, problem)
@@ -47,13 +63,13 @@ def active_learning_loop(model, train_x_mt, train_y_mt, problem, acq_method, max
 
         # Append new training points to training tensor
         new_x_task = torch.column_stack([new_x, torch.tensor(task_list)])
-        train_x_mt = torch.vstack((train_x_mt, new_x_task))
-        train_y_mt = torch.vstack((train_y_mt, new_y))
+        train_x = torch.vstack((train_x, new_x_task))
+        train_y = torch.vstack((train_y, new_y))
 
                     
-        model = MultiTaskGP(train_x_mt,train_y_mt,task_feature=-1,
+        model = MultiTaskGP(train_x,train_y,task_feature=-1,
                             input_transform=Normalize(d=dim+1,bounds=bounds_task,indices=list(range(0,dim))),
-                            outcome_transform=None)
+                            outcome_transform=Standardize(m=1))
         mt_mll = ExactMarginalLogLikelihood(model.likelihood, model)
 
         '''
@@ -89,9 +105,14 @@ def active_learning_loop(model, train_x_mt, train_y_mt, problem, acq_method, max
         # Increment evaluation counter. TODO maybe move this closer to where it happens
         num_evals.append(num_evals[-1]+len(task_list))
 
+        # Update result
+        trained_gp.model = model
+        trained_gp.train_x = train_x
+        trained_gp.train_y = train_y
+
         if save_hist is not None:
-            update_history_list(dist_history, input_list, model, problem)
-    
+            update_history_list(dist_history, trained_gp, input_list, truth_list)
+
     if disp:
         print('done')  
 
@@ -102,10 +123,7 @@ def active_learning_loop(model, train_x_mt, train_y_mt, problem, acq_method, max
             }
         torch.save(hist, filename)
 
-    return {'model':model, 
-            'problem':problem,
-            'train_x':train_x_mt, 
-            'train_y':train_y_mt}
+    return trained_gp
 
 
 
@@ -113,43 +131,48 @@ def active_learning_loop(model, train_x_mt, train_y_mt, problem, acq_method, max
     
 
 # Track convergence history
-def convergence_obj(x, model):
+def convergence_obj(x, y, model):
     # x_tens = torch.tensor(x).squeeze().detach().numpy()
-    pred1 = model.likelihood(model(torch.column_stack([x, torch.zeros(1)])))
-    pred2 = model.likelihood(model(torch.column_stack([x, torch.ones(1)])))
+    y_mean = y.mean().item()
+    y_std = y.std().item()
+    pred1 = y_mean + (model.likelihood(model(torch.column_stack([x, torch.zeros(1)]))))*y_std
+    pred2 = y_mean + (model.likelihood(model(torch.column_stack([x, torch.ones(1)]))))*y_std
     return (pred1.mean**2) + (pred2.mean**2)
 
-def convergence_obj_scipy(x, model):
+def convergence_obj_scipy(x, y, model):
     x_tens = torch.tensor(x).unsqueeze(0)
-    return convergence_obj(x_tens, model).squeeze().detach().numpy()
+    return convergence_obj(x_tens, y, model).squeeze().detach().numpy()
 
-def convergence_obj_grad(x, model):
+def convergence_obj_grad(x, y, model):
     x.requires_grad = True
-    x_conv = convergence_obj(x, model)
+    x_conv = convergence_obj(x, y, model)
     x_conv.backward(torch.ones_like(x_conv))
     return x.grad
 
-def convergence_obj_grad_scipy(x, model):
+def convergence_obj_grad_scipy(x, y, model):
     x_tens = torch.tensor(x).unsqueeze(0)
-    return convergence_obj_grad(x_tens, model).squeeze().detach().numpy().astype(np.float64)
+    return convergence_obj_grad(x_tens, y, model).squeeze().detach().numpy().astype(np.float64)
 
 # assume x and input are pre-scaled
-def residual_intersection(x, model, bounds, specify_input = None):
-    p1 = model.likelihood(model(torch.column_stack([x, torch.zeros(1).repeat(x.size(0))])))
-    p2 = model.likelihood(model(torch.column_stack([x, torch.ones(1).repeat(x.size(0))])))
+def residual_intersection(x0, trained_gp):
+    model = trained_gp.model
+    problem = trained_gp.problem
+    bounds = problem.bounds
+    dim = problem.dim
+    input_dim = problem.input_dim
+    y = trained_gp.train_y
 
-    # Find x0
-    x0 = x[torch.argmin(p1.mean**2 + p2.mean**2)]
-        
-    bounds_scaled = torch.tensor([0.,1.]).reshape(-1,1).repeat(1,7)
-    if specify_input is not None:
-        bounds_scaled[:,:len(specify_input)] = specify_input
-        x0[:len(specify_input)] = specify_input
-    bounds_scipy = Bounds(bounds_scaled[0,:], bounds_scaled[1,:])
+    # Scale inputs
+    x0 = normalize(x0, bounds)
+
+    # Scipy bounds
+    bounds_norm = torch.tensor([0.,1.]).reshape(-1,1).repeat(1,dim)
+    bounds_norm[:,:input_dim] = x0[:input_dim]
+    bounds_scipy = Bounds(bounds_norm[0,:], bounds_norm[1,:])
 
     res = minimize(convergence_obj_scipy, x0,
-                   method='SLSQP',
-                   args=(model), 
+                   method='L-BFGS-B',
+                   args=(y, model), 
                    jac=convergence_obj_grad_scipy,
                    options={'ftol': 1e-8},
                    bounds=bounds_scipy)
@@ -160,24 +183,17 @@ def residual_intersection(x, model, bounds, specify_input = None):
 def convergence_dist(u_candidate, truth):
     return torch.sum((u_candidate - truth)**2)**0.5
 
-def update_history_list(dist_history, input_list, model, problem, truth=torch.tensor([8.89897949, 11.89897949]), npts=100, ):
+def update_history_list(dist_history, trained_gp, input_list, truth_list):
+    problem = trained_gp.problem
     bounds = problem.bounds
-    dim = bounds.size(1)
+    dim = problem.dim
+    input_dim = problem.input_dim
     
-    for input_vec in input_list:
-        assert(input_vec.size(0)==dim-2)
-        # Truth is currently hardcoded, but should be computed using OpenMDAO or similar
-        # truth = from_OpenMDAO(input_vec)
-        # truth = torch.tensor([8.89897949, 11.89897949])
-    
-        sampler = qmc.LatinHypercube(d=2)
-        test_x = torch.column_stack([input_vec.repeat(npts,1),
-                                     torch.tensor(qmc.scale(sampler.random(n=npts), bounds[0,-2:], bounds[1,-2:]))])
-        test_x_normalized = normalize(test_x, bounds)
-        
-        input_vec_normalized = normalize(input_vec, bounds[:,:dim-2])
-        
-        x_candidate = residual_intersection(test_x_normalized, model, bounds, input_vec_normalized)
-        u_candidate = x_candidate[-2:] # unnormalized intersection point
+    for input_vec, truth in zip(input_list, truth_list):
+
+        # use truth as x0
+        x0 = torch.cat((input_vec, truth))
+        x_candidate = residual_intersection(x0, trained_gp)
+        u_candidate = x_candidate[input_dim:]
     
         dist_history.append(convergence_dist(u_candidate, truth).numpy().item())

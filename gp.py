@@ -1,4 +1,5 @@
 import math
+import warnings
 import numpy as np
 import torch
 from scipy.stats import qmc
@@ -7,10 +8,19 @@ from gpytorch.mlls import ExactMarginalLogLikelihood
 from botorch.fit import fit_gpytorch_mll
 from botorch.models.transforms import Normalize, Standardize
 from botorch.utils.transforms import normalize, unnormalize, standardize
+from botorch.optim.fit import fit_gpytorch_mll_torch
+from botorch.exceptions.warnings import OptimizationWarning
 
-def train_multitask_gp(problem, num_train=10, seed=None):
+class TrainedGP:
+    def __init__(self, problem, model, x, y):
+        self.model = model
+        self.problem = problem
+        self.train_x = x
+        self.train_y = y    
+
+def train_multitask_gp(problem, num_train=10, seed=None, disp=True): 
     bounds = problem.bounds
-    dim = bounds.size(1)
+    dim = problem.dim
     task_list = problem.tasks
     ntasks = len(task_list)
     sampler = qmc.LatinHypercube(d=dim, seed=seed)
@@ -28,11 +38,38 @@ def train_multitask_gp(problem, num_train=10, seed=None):
     train_y = problem.res # tensor with shape num_train x ntasks
     train_y_mt = train_y.transpose(0,1).reshape(-1,1)
 
-    mt_model = MultiTaskGP(train_x_mt, train_y_mt, task_feature=-1,
-                           input_transform=Normalize(d=dim+1, bounds=bounds_task, indices=list(range(0,dim+1))),
-                           outcome_transform=None)
+    # mt_model = MultiTaskGP(normalize(train_x_mt, bounds_task), standardize(train_y_mt), task_feature=-1,)
+                           # input_transform=Normalize(d=dim+1, bounds=bounds_task, indices=list(range(0,dim+1))),
+                           # outcome_transform=Standardize(m=1))
 
+    mt_model = MultiTaskGP(train_x_mt, train_y_mt, task_feature = -1,
+                           input_transform = Normalize(d=dim+1, bounds=bounds_task, indices=list(range(0,dim+1))),
+                           outcome_transform = Standardize(m=1))
+    
     mt_mll = ExactMarginalLogLikelihood(mt_model.likelihood, mt_model)
     fit_gpytorch_mll(mt_mll)
 
-    return mt_model, train_x_mt, train_y_mt
+    # warnings.filterwarnings("error", category=OptimizationWarning)
+
+    # try:
+    #     mt_mll = ExactMarginalLogLikelihood(mt_model.likelihood, mt_model)
+    #     fit_gpytorch_mll(mt_mll)
+    # except OptimizationWarning:
+    #     if disp:
+    #         print("GP fitting failed. Retrying using Adam...")
+    #     mt_mll = ExactMarginalLogLikelihood(mt_model.likelihood, mt_model)
+    #     fit_gpytorch_mll(mt_mll, optimizer=fit_gpytorch_mll_torch)
+
+    # mt_mll = ExactMarginalLogLikelihood(mt_model.likelihood, mt_model)
+    # fit_gpytorch_mll(mt_mll)
+    # fit_gpytorch_mll(mt_mll, optimizer=fit_gpytorch_mll_torch)
+
+    # warnings.filterwarnings("default")
+
+    hyperparams = mt_model.state_dict()
+    torch.save(hyperparams, 'hyperparams.pt')
+
+    result = TrainedGP(problem, mt_model, train_x_mt, train_y_mt)
+    
+    return result
+
