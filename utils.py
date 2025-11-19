@@ -40,24 +40,3 @@ def sample_in_bounds(bounds: torch.Tensor, num_samples, specify_input: list = No
                                        samples ))
         
     return samples
-    
-
-
-
-
-    bounds = problem.bounds
-    # Normalize bounds and x0
-    d = bounds.size(1)
-    bounds_scaled = torch.tensor([0.,1.]).reshape(-1,1).repeat(1,d)
-        
-    # If specified, set design vars.
-    if specify_input is not None:
-        input_length = torch.tensor(specify_input).size(1)
-        bounds_scaled[:,:input_length] = normalize(torch.tensor(specify_input), 
-                                                   bounds[:,:input_length])
-
-    # Generate N random samples within NORMALIZED bounds
-    # fix this
-    X_samples = torch.tensor(np.random.uniform(low=bounds_scaled[0,:],
-                                               high=bounds_scaled[1,:],
-                                               size=(num_samples,d)))
