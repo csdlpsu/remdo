@@ -12,6 +12,7 @@ from scipy.stats import qmc
 import numpy as np
 import os
 from acquisition import _get_acq_func
+from utils import unstandardize
 
 # def active_learning_loop(model, train_x_mt, train_y_mt, problem, acq_method, maxiters=20, disp=True, save_hist=None, log_hyperparams=False):
 def active_learning_loop(trained_gp, acq_method, maxiters=20, disp=True, save_hist: tuple[torch.Tensor, str] = None, log_hyperparams=False):
@@ -116,11 +117,13 @@ def active_learning_loop(trained_gp, acq_method, maxiters=20, disp=True, save_hi
 
 # Track convergence history
 def convergence_obj(x, y, model):
-    # x_tens = torch.tensor(x).squeeze().detach().numpy()
-    y_mean = y.mean().item()
-    y_std = y.std().item()
-    pred1 = y_mean + (model.likelihood(model(torch.column_stack([x, torch.zeros(1)]))))*y_std
-    pred2 = y_mean + (model.likelihood(model(torch.column_stack([x, torch.ones(1)]))))*y_std
+    # # x_tens = torch.tensor(x).squeeze().detach().numpy()
+    # y_mean = y.mean().item()
+    # y_std = y.std().item()
+    # pred1 = y_mean + (model.likelihood(model(torch.column_stack([x, torch.zeros(1)]))))*y_std
+    # pred2 = y_mean + (model.likelihood(model(torch.column_stack([x, torch.ones(1)]))))*y_std
+    pred1 = unstandardize(model.likelihood(model(torch.column_stack([x, torch.zeros(1)]))), y)
+    pred2 = unstandardize(model.likelihood(model(torch.column_stack([x, torch.ones(1)]))), y)
     return (pred1.mean**2) + (pred2.mean**2)
 
 def convergence_obj_scipy(x, y, model):
