@@ -183,7 +183,7 @@ class Aerostructures(MDA):
 
         # Properties below are required for all problem classes.
         self._bounds = torch.tensor([[0,   0,   -np.pi/2],
-                                     [500, 1000, np.pi/2])
+                                     [500, 1000, np.pi/2]])
         self._dim = 3
         self._input_dim = 1
         self._coupling_dim = 2
@@ -221,7 +221,7 @@ class Aerostructures(MDA):
         phi = self._phi
         L = self._L
         
-        return L - q*B*C*(2*np.pi*(phi+psi) + r*(1-torch.cos(np.pi/2*(phi+psi)/theta0))
+        return L - q*B*C*(2*np.pi*(phi+psi)) + r*(1-torch.cos(np.pi/2*(phi+psi)/theta0)) # PLEASE CHECK THIS
 
     @property
     def r2(self):
