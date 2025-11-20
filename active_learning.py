@@ -52,7 +52,7 @@ def active_learning_loop(trained_gp, acq_method, maxiters=20, disp=True, save_hi
         # Run OpenMDAO problem from test function
         for input_vec in input_list:
             assert(input_vec.size(0)==input_dim)
-            truth_list = torch.vstack((truth_list, problem.fromOpenMDAO(input_vec)))
+            truth_list = torch.vstack((truth_list, problem.from_OpenMDAO(input_vec)))
 
         update_history_list(dist_history, trained_gp, input_list, truth_list)
 

@@ -126,7 +126,7 @@ class Satellite(MDA):
     # def obj(self):
     #     return self.g1 + self.g2
 
-    def _runOpenMDAO(self, x_input):
+    def _run_OpenMDAO(self, x_input):
         prob = om.Problem()
         prob.model = satelliteGroup()
         prob.model.linear_solver = om.LinearBlockGS()
@@ -154,8 +154,8 @@ class Satellite(MDA):
         # return prob
         self._openmdao_result = prob
 
-    def fromOpenMDAO(self, x_input):
-        self._runOpenMDAO(x_input)
+    def from_OpenMDAO(self, x_input):
+        self._run_OpenMDAO(x_input)
         prob = self._openmdao_result
         return torch.tensor([prob.get_val('u12').item(), prob.get_val('u21').item()])
 
@@ -268,9 +268,9 @@ class Aerostructures(MDA):
     # def obj(self):
     #     return self.g1 + self.g2
 
-    def _runOpenMDAO(self, x_input):
+    def _run_OpenMDAO(self, x_input):
         self._openmdao_result = x_input
 
-    def fromOpenMDAO(self, x_input):
-        self._runOpenMDAO(x_input)
+    def from_OpenMDAO(self, x_input):
+        self._run_OpenMDAO(x_input)
         return torch.ones(2)
