@@ -183,8 +183,8 @@ class Aerostructures(MDA):
         self._phi = 0
 
         # Properties below are required for all problem classes.
-        self._bounds = torch.tensor([[0,   0,   -np.pi/2],
-                                     [500, 1000, np.pi/2]])
+        self._bounds = torch.tensor([[0,   -20000,   -np.pi/2],
+                                     [300, 20000, np.pi/2]])
         self._dim = 3
         self._input_dim = 1
         self._coupling_dim = 2
@@ -238,7 +238,7 @@ class Aerostructures(MDA):
         L = self._L
         phi = self._phi
 
-        return phi - (L/(k1*(1+p))-(L*p)/(k2*(1+p)))*(1/(C*(z2-z1)))
+        return phi - torch.remainder((L/(k1*(1+p))-(L*p)/(k2*(1+p)))*(1/(C*(z2-z1))), 2*np.pi)
         
     @property
     def res(self):
@@ -279,7 +279,7 @@ class Aerostructures(MDA):
         prob.driver.options['tol'] = 1e-8
         prob.driver.options['disp'] = False
         
-        prob.model.add_design_var('B', lower = 0., upper = 500.)
+        prob.model.add_design_var('B', lower = 0., upper = 400.)
         
         prob.model.approx_totals()
         

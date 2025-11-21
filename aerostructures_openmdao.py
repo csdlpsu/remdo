@@ -54,7 +54,7 @@ class structuresDis(om.ExplicitComponent):
 
         L = inputs['L']
 
-        outputs['phi'] = ( L/(k1*(1+p)) - (L*p)/(k2*(1+p)) ) * ( 1/(C*(z2-z1)) )
+        outputs['phi'] = np.remainder(( L/(k1*(1+p)) - (L*p)/(k2*(1+p)) ) * ( 1/(C*(z2-z1)) ), 2*np.pi)
         
 class aerostructuresGroup(om.Group):
     def setup(self):
