@@ -12,6 +12,7 @@ from scipy.stats import qmc
 import numpy as np
 import os
 from acquisition import _get_acq_func
+from utils import unstandardize
 
 # def active_learning_loop(model, train_x_mt, train_y_mt, problem, acq_method, maxiters=20, disp=True, save_hist=None, log_hyperparams=False):
 def active_learning_loop(trained_gp, acq_method, maxiters=20, disp=True, save_hist: tuple[torch.Tensor, str] = None, log_hyperparams=False):
@@ -52,7 +53,7 @@ def active_learning_loop(trained_gp, acq_method, maxiters=20, disp=True, save_hi
         # Run OpenMDAO problem from test function
         for input_vec in input_list:
             assert(input_vec.size(0)==input_dim)
-            truth_list = torch.vstack((truth_list, problem.fromOpenMDAO(input_vec)))
+            truth_list = torch.vstack((truth_list, problem.from_OpenMDAO(input_vec)))
 
         update_history_list(dist_history, trained_gp, input_list, truth_list)
 
@@ -116,11 +117,13 @@ def active_learning_loop(trained_gp, acq_method, maxiters=20, disp=True, save_hi
 
 # Track convergence history
 def convergence_obj(x, y, model):
-    # x_tens = torch.tensor(x).squeeze().detach().numpy()
-    y_mean = y.mean().item()
-    y_std = y.std().item()
-    pred1 = y_mean + (model.likelihood(model(torch.column_stack([x, torch.zeros(1)]))))*y_std
-    pred2 = y_mean + (model.likelihood(model(torch.column_stack([x, torch.ones(1)]))))*y_std
+    # # x_tens = torch.tensor(x).squeeze().detach().numpy()
+    # y_mean = y.mean().item()
+    # y_std = y.std().item()
+    # pred1 = y_mean + (model.likelihood(model(torch.column_stack([x, torch.zeros(1)]))))*y_std
+    # pred2 = y_mean + (model.likelihood(model(torch.column_stack([x, torch.ones(1)]))))*y_std
+    pred1 = unstandardize(model.likelihood(model(torch.column_stack([x, torch.zeros(1)]))), y)
+    pred2 = unstandardize(model.likelihood(model(torch.column_stack([x, torch.ones(1)]))), y)
     return (pred1.mean**2) + (pred2.mean**2)
 
 def convergence_obj_scipy(x, y, model):
@@ -154,13 +157,21 @@ def residual_intersection(x0, trained_gp):
     bounds_norm[:,:input_dim] = x0[:input_dim]
     bounds_scipy = Bounds(bounds_norm[0,:], bounds_norm[1,:])
 
+    # res = minimize(convergence_obj_scipy, x0,
+    #                method='L-BFGS-B',
+    #                args=(y, model), 
+    #                jac=convergence_obj_grad_scipy,
+    #                options={'ftol': 1e-8},
+    #                bounds=bounds_scipy)
+
     res = minimize(convergence_obj_scipy, x0,
-                   method='L-BFGS-B',
+                   method='BFGS',
                    args=(y, model), 
                    jac=convergence_obj_grad_scipy,
-                   options={'ftol': 1e-8},
-                   bounds=bounds_scipy)
-
+                   tol=1e-8
+                   # options={'tol': 1e-8}
+                  )
+    
     return unnormalize(torch.tensor(res.x), bounds)
     # return torch.tensor(res.x)
 

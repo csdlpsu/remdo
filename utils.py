@@ -20,6 +20,12 @@ def func_scipy(func):
         return func(x_tensor, *args).squeeze().detach().numpy().astype(np.float64)
     return scipyf
 
+# reverse standardization process using training data y
+def unstandardize(X, y: torch.Tensor):
+    y_mean = y.mean().item()
+    y_std = y.std().item()
+    return X*y_std + y_mean
+
 # inputs:
 # bounds        | 2 x d tensor
 # num_samples   | scalar

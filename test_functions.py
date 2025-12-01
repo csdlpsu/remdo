@@ -4,6 +4,7 @@ import numpy as np
 import torch
 import openmdao.api as om
 from satellite_openmdao import satelliteGroup
+from aerostructures_openmdao import aerostructuresGroup
 
 # Abstract base class for MDA problems. 
 class MDA(ABC):
@@ -126,7 +127,7 @@ class Satellite(MDA):
     # def obj(self):
     #     return self.g1 + self.g2
 
-    def _runOpenMDAO(self, x_input):
+    def _run_OpenMDAO(self, x_input):
         prob = om.Problem()
         prob.model = satelliteGroup()
         prob.model.linear_solver = om.LinearBlockGS()
@@ -154,8 +155,8 @@ class Satellite(MDA):
         # return prob
         self._openmdao_result = prob
 
-    def fromOpenMDAO(self, x_input):
-        self._runOpenMDAO(x_input)
+    def from_OpenMDAO(self, x_input):
+        self._run_OpenMDAO(x_input)
         prob = self._openmdao_result
         return torch.tensor([prob.get_val('u12').item(), prob.get_val('u21').item()])
 
@@ -182,8 +183,8 @@ class Aerostructures(MDA):
         self._phi = 0
 
         # Properties below are required for all problem classes.
-        self._bounds = torch.tensor([[0,   0,   -np.pi/2],
-                                     [500, 1000, np.pi/2]])
+        self._bounds = torch.tensor([[0,   -20000,   -np.pi/2],
+                                     [300, 20000, np.pi/2]])
         self._dim = 3
         self._input_dim = 1
         self._coupling_dim = 2
@@ -221,7 +222,8 @@ class Aerostructures(MDA):
         phi = self._phi
         L = self._L
         
-        return L - q*B*C*(2*np.pi*(phi+psi)) + r*(1-torch.cos(np.pi/2*(phi+psi)/theta0)) # PLEASE CHECK THIS
+        return L - q*B*C*((2*np.pi*(phi+psi)) + r*(1-torch.cos(np.pi/2*(phi+psi)/theta0))) # PLEASE CHECK THIS
+        # Checked
 
     @property
     def r2(self):
@@ -236,7 +238,7 @@ class Aerostructures(MDA):
         L = self._L
         phi = self._phi
 
-        return phi - (L/(k1*(1+p))-(L*p)/(k2*(1+p)))*(1/(C*(z2-z1)))
+        return phi - torch.remainder((L/(k1*(1+p))-(L*p)/(k2*(1+p)))*(1/(C*(z2-z1))), 2*np.pi)
         
     @property
     def res(self):
@@ -268,9 +270,28 @@ class Aerostructures(MDA):
     # def obj(self):
     #     return self.g1 + self.g2
 
-    def _runOpenMDAO(self, x_input):
-        self._openmdao_result = x_input
+    def _run_OpenMDAO(self, x_input):
+        prob = om.Problem()
+        prob.model = aerostructuresGroup()
+        
+        prob.driver = om.ScipyOptimizeDriver()
+        prob.driver.options['optimizer'] = 'COBYQA'
+        prob.driver.options['tol'] = 1e-8
+        prob.driver.options['disp'] = False
+        
+        prob.model.add_design_var('B', lower = 0., upper = 400.)
+        
+        prob.model.approx_totals()
+        
+        prob.setup()
+        
+        prob.set_val('B', x_input)
+        
+        prob.run_model()
+        
+        self._openmdao_result = prob
 
-    def fromOpenMDAO(self, x_input):
-        self._runOpenMDAO(x_input)
-        return torch.ones(2)
+    def from_OpenMDAO(self, x_input):
+        self._run_OpenMDAO(x_input)
+        prob = self._openmdao_result
+        return torch.tensor([prob.get_val('L').item(), prob.get_val('phi').item()])
