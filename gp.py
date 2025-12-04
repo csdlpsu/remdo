@@ -36,7 +36,7 @@ def train_multitask_gp(problem, num_train=10, seed=None, disp=True):
     # Evaluate residuals
     problem.set_vars(train_x)
     train_y = problem.res # tensor with shape num_train x ntasks
-    train_y_mt = train_y.transpose(0,1).reshape(-1,1)
+    train_y_mt = standardize(train_y).transpose(0,1).reshape(-1,1)
 
     # mt_model = MultiTaskGP(normalize(train_x_mt, bounds_task), standardize(train_y_mt), task_feature=-1,)
                            # input_transform=Normalize(d=dim+1, bounds=bounds_task, indices=list(range(0,dim+1))),
@@ -44,9 +44,7 @@ def train_multitask_gp(problem, num_train=10, seed=None, disp=True):
 
     mt_model = MultiTaskGP(train_x_mt, train_y_mt, task_feature = -1,
                            input_transform = Normalize(d=dim+1, bounds=bounds_task, indices=list(range(0,dim))),
-                           # outcome_transform = Standardize(m=1))
-                           #TODO: Rewrite standardize to do all tasks separately
-                          )
+                           outcome_transform = None)
     
     mt_mll = ExactMarginalLogLikelihood(mt_model.likelihood, mt_model)
     fit_gpytorch_mll(mt_mll)
@@ -71,7 +69,7 @@ def train_multitask_gp(problem, num_train=10, seed=None, disp=True):
     hyperparams = mt_model.state_dict()
     torch.save(hyperparams, 'hyperparams.pt')
 
-    result = TrainedGP(problem, mt_model, train_x_mt, train_y_mt)
+    result = TrainedGP(problem, mt_model, train_x_mt, train_y)
     
     return result
 

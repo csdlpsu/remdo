@@ -18,8 +18,8 @@ from utils import unstandardize
 def active_learning_loop(trained_gp, acq_method, maxiters=20, disp=True, save_hist: tuple[torch.Tensor, str, str] = None, log_hyperparams=False):
     # unpack results structure
     model = trained_gp.model
-    train_x = trained_gp.train_x
-    train_y = trained_gp.train_y
+    train_x = trained_gp.train_x # has shape ntrain x d+1
+    train_y = trained_gp.train_y # has shape ntrain x ntasks
     problem = trained_gp.problem
     
     task_list = problem.tasks
@@ -48,7 +48,7 @@ def active_learning_loop(trained_gp, acq_method, maxiters=20, disp=True, save_hi
         truth_list = torch.empty(0,coupling_dim)
         filename = save_hist[1]
         truth_from = save_hist[2]
-        num_evals = [train_y.size(0)]
+        num_evals = [train_y.numel()]
         dist_history = []
 
     
@@ -67,20 +67,42 @@ def active_learning_loop(trained_gp, acq_method, maxiters=20, disp=True, save_hi
         # Currently this calculates all residuals for all new x points. 
         # This results in extra evaluations.
         # Fine for now since the function is inexpensive, but needs to be looked at in the future.
-        new_y = torch.diagonal(problem.res).reshape(-1,1)
+        new_y = torch.diagonal(problem.res)
                 
         if disp:
             print(f"Iter {i+1}")
 
         # Append new training points to training tensor
+        # Steps to keep train_x sorted by task:
+        # 1. split train_x by task and stack horizontally
+        # 2. add task feature to new_x and reshape into row vector
+        # 3. stack train_x and new_x
+        # 4. split train_x again and stack vertically
+
+        # step 1
+        ntrain_per_task = len(train_x) // len(task_list) # training points per task, whole number
+        split_x = torch.hstack(train_x.split(ntrain_per_task, dim=0))
+
+        # step 2
+        # new_x_task looks like this: [t0x1, t0x2, t0x3, ... 0]
+        #                             [t1x1, t1x2, t1x3, ... 1] etc.
         new_x_task = torch.column_stack([new_x, torch.tensor(task_list)])
-        train_x = torch.vstack((train_x, new_x_task))
+        new_x_task = new_x_task.reshape(1,-1)
+
+        # step 3
+        split_x = torch.vstack((split_x, new_x_task))
+
+        # step 4
+        train_x = torch.vstack(split_x.split(dim+1, dim=1))
+        
         train_y = torch.vstack((train_y, new_y))
+        train_y_mt = standardize(train_y).transpose(0,1).reshape(-1,1)
 
         # Train GP
-        model = MultiTaskGP(train_x,train_y,task_feature=-1,
+        model = MultiTaskGP(train_x,train_y_mt,task_feature=-1,
                             input_transform=Normalize(d=dim+1,bounds=bounds_task,indices=list(range(0,dim))),
-                            outcome_transform=Standardize(m=1))
+                            # outcome_transform=Standardize(m=1))
+                            outcome_transform=None)
         mt_mll = ExactMarginalLogLikelihood(model.likelihood, model)
 
         fit_gpytorch_mll(mt_mll)
@@ -120,8 +142,8 @@ def active_learning_loop(trained_gp, acq_method, maxiters=20, disp=True, save_hi
 
 # Track convergence history
 def convergence_obj(x, y, model):
-    pred1 = unstandardize(model.likelihood(model(torch.column_stack([x, torch.zeros(1)]))), y)
-    pred2 = unstandardize(model.likelihood(model(torch.column_stack([x, torch.ones(1)]))), y)
+    pred1 = unstandardize(model.likelihood(model(torch.column_stack([x, torch.zeros(1)]))), y[:,0])
+    pred2 = unstandardize(model.likelihood(model(torch.column_stack([x, torch.ones(1)]))), y[:,1])
     return (pred1.mean**2) + (pred2.mean**2)
 
 def convergence_obj_scipy(x, y, model):
