@@ -35,7 +35,7 @@ for REP in range(REPS):
         print(f"REP {REP}", flush=True)
         print(f"-------------------", flush=True)
         active_learning_loop(gpmodel, acq_method='entropy', maxiters=maxiters,
-                             disp=True, save_hist=(x_input, histname),
+                             disp=True, save_hist=(x_input, histname, 'openmdao),
                              log_hyperparams=False)
 
         try:
