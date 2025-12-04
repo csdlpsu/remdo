@@ -30,7 +30,7 @@ class aerodynamicsDis(om.ExplicitComponent):
         B = inputs['B']
         phi = inputs['phi']
 
-        outputs['L'] = q*B*C * ((2*np.pi*(phi+psi)) + r*(1-np.cos(np.pi/2*(phi+psi)/theta0)))
+        outputs['L'] = 1/1000 * q*B*C * ((2*np.pi*(phi+psi)) + r*(1-np.cos(np.pi/2*(phi+psi)/theta0)))
 
 class structuresDis(om.ExplicitComponent):
     def setup(self):
@@ -54,7 +54,7 @@ class structuresDis(om.ExplicitComponent):
 
         L = inputs['L']
 
-        outputs['phi'] = np.remainder(( L/(k1*(1+p)) - (L*p)/(k2*(1+p)) ) * ( 1/(C*(z2-z1)) ), 2*np.pi)
+        outputs['phi'] = np.remainder(( 1000*L/(k1*(1+p)) - (1000*L*p)/(k2*(1+p)) ) * ( 1/(C*(z2-z1)) ), 2*np.pi)
         
 class aerostructuresGroup(om.Group):
     def setup(self):
@@ -64,7 +64,7 @@ class aerostructuresGroup(om.Group):
         cycle.add_subsystem('strux', structuresDis(), promotes_inputs=['L'],
                             promotes_outputs=['phi'])
 
-        cycle.linear_solver = om.DirectSolver(rhs_checking=True)
+        cycle.linear_solver = om.DirectSolver(rhs_checking=False)
         nlbgs = cycle.nonlinear_solver = om.NonlinearBlockGS()
         nlbgs.options['maxiter'] = 1000
         nlbgs.options['iprint'] = 0

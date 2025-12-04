@@ -109,7 +109,7 @@ class Satellite(MDA):
         self._u21 = x[:,-1]
 
     def set_bounds(self, bounds) -> None:
-        if x.shape[1] != 7 or x.shape[0] != 2:
+        if bounds.shape[1] != 7 or bounds.shape[0] != 2:
             raise ValueError()
         self._bounds = bounds
 
@@ -183,8 +183,8 @@ class Aerostructures(MDA):
         self._phi = 0
 
         # Properties below are required for all problem classes.
-        self._bounds = torch.tensor([[0,   -20000,   -np.pi/2],
-                                     [300, 20000, np.pi/2]])
+        self._bounds = torch.tensor([[0,   -20,   -np.pi/2],
+                                     [300, 20, np.pi/2]])
         self._dim = 3
         self._input_dim = 1
         self._coupling_dim = 2
@@ -222,7 +222,7 @@ class Aerostructures(MDA):
         phi = self._phi
         L = self._L
         
-        return L - q*B*C*((2*np.pi*(phi+psi)) + r*(1-torch.cos(np.pi/2*(phi+psi)/theta0))) # PLEASE CHECK THIS
+        return L - 1/1000*q*B*C*((2*np.pi*(phi+psi)) + r*(1-torch.cos(np.pi/2*(phi+psi)/theta0))) # PLEASE CHECK THIS
         # Checked
 
     @property
@@ -238,7 +238,7 @@ class Aerostructures(MDA):
         L = self._L
         phi = self._phi
 
-        return phi - torch.remainder((L/(k1*(1+p))-(L*p)/(k2*(1+p)))*(1/(C*(z2-z1))), 2*np.pi)
+        return phi - (1000*L/(k1*(1+p))-(1000*L*p)/(k2*(1+p)))*(1/(C*(z2-z1)))
         
     @property
     def res(self):
@@ -279,7 +279,7 @@ class Aerostructures(MDA):
         prob.driver.options['tol'] = 1e-8
         prob.driver.options['disp'] = False
         
-        prob.model.add_design_var('B', lower = 0., upper = 400.)
+        prob.model.add_design_var('B', lower = 0., upper = 300.)
         
         prob.model.approx_totals()
         

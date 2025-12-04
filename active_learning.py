@@ -1,7 +1,7 @@
 import torch
 import warnings
 from gpytorch.mlls import ExactMarginalLogLikelihood
-from botorch.models.multitask import MultiTaskGP
+from botorch.models import SingleTaskGP, MultiTaskGP, ModelListGP
 from botorch.fit import fit_gpytorch_mll
 from botorch.models.transforms import Normalize, Standardize
 from botorch.utils.transforms import normalize, unnormalize, standardize
@@ -15,7 +15,7 @@ from acquisition import _get_acq_func
 from utils import unstandardize
 
 # def active_learning_loop(model, train_x_mt, train_y_mt, problem, acq_method, maxiters=20, disp=True, save_hist=None, log_hyperparams=False):
-def active_learning_loop(trained_gp, acq_method, maxiters=20, disp=True, save_hist: tuple[torch.Tensor, str] = None, log_hyperparams=False):
+def active_learning_loop(trained_gp, acq_method, maxiters=20, disp=True, save_hist: tuple[torch.Tensor, str, str] = None, log_hyperparams=False):
     # unpack results structure
     model = trained_gp.model
     train_x = trained_gp.train_x
@@ -40,20 +40,23 @@ def active_learning_loop(trained_gp, acq_method, maxiters=20, disp=True, save_hi
     # Save to log files
     if save_hist is not None:
         # Check input type for list/tensor
-        if type(save_hist) == torch.Tensor:
+        if type(save_hist[0]) == torch.Tensor:
             input_list = save_hist[0].reshape(-1,input_dim)
         else:
             input_list = torch.tensor(save_hist[0]).reshape(-1,input_dim)
         # Storage variables
         truth_list = torch.empty(0,coupling_dim)
         filename = save_hist[1]
+        truth_from = save_hist[2]
         num_evals = [train_y.size(0)]
         dist_history = []
 
+    
         # Run OpenMDAO problem from test function
         for input_vec in input_list:
-            assert(input_vec.size(0)==input_dim)
-            truth_list = torch.vstack((truth_list, problem.from_OpenMDAO(input_vec)))
+            if truth_from == 'openmdao':
+                assert(input_vec.size(0)==input_dim)
+                truth_list = torch.vstack((truth_list, problem.from_OpenMDAO(input_vec)))
 
         update_history_list(dist_history, trained_gp, input_list, truth_list)
 
@@ -117,11 +120,6 @@ def active_learning_loop(trained_gp, acq_method, maxiters=20, disp=True, save_hi
 
 # Track convergence history
 def convergence_obj(x, y, model):
-    # # x_tens = torch.tensor(x).squeeze().detach().numpy()
-    # y_mean = y.mean().item()
-    # y_std = y.std().item()
-    # pred1 = y_mean + (model.likelihood(model(torch.column_stack([x, torch.zeros(1)]))))*y_std
-    # pred2 = y_mean + (model.likelihood(model(torch.column_stack([x, torch.ones(1)]))))*y_std
     pred1 = unstandardize(model.likelihood(model(torch.column_stack([x, torch.zeros(1)]))), y)
     pred2 = unstandardize(model.likelihood(model(torch.column_stack([x, torch.ones(1)]))), y)
     return (pred1.mean**2) + (pred2.mean**2)
