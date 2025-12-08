@@ -3,7 +3,7 @@ import openmdao.api as om
 import os
 
 os.environ['OPENMDAO_REPORTS'] = 'none'
-
+os.environ['OPENMDAO_USE_MPI'] = 'false'
 
 class satelliteDis1(om.ExplicitComponent):
     def setup(self):
