@@ -14,6 +14,9 @@ REPS  = 20 # number of repetitions
 histname = "hist_sat.pt"
 bounds  = torch.tensor([[0., 0., 0., 0., 0.],
                         [2., 2., 2., 2., 2.]], dtype=dtype, device=device) # always a 2 x d tensor
+torch.manual_seed(111)
+x_input = unnormalize(torch.rand(1, 5), bounds=bounds)
+
 num_train = 10
 maxiters = 15
 
@@ -25,17 +28,13 @@ for REP in range(REPS):
 
     if REP % size == rank:
 
-        np.random.seed(111 + REP)
-        torch.manual_seed(111 + REP)
-        x_input = unnormalize(torch.rand(1, 5), bounds=bounds)
-
         sat_prob = Satellite()
         gpmodel = train_multitask_gp(sat_prob, num_train=num_train, seed=111 + REP)
         print(f"-------------------", flush=True)
         print(f"REP {REP}", flush=True)
         print(f"-------------------", flush=True)
         active_learning_loop(gpmodel, acq_method='entropy', maxiters=maxiters,
-                             disp=True, save_hist=(x_input, histname, 'openmdao),
+                             disp=True, save_hist=(x_input, histname, 'openmdao'),
                              log_hyperparams=False)
 
         try:
