@@ -45,7 +45,7 @@ for REP in range(REPS):
         except FileNotFoundError:
             directory_name = "results/satellite"
             dfilename = directory_name + "/" + f"dhist_REP_{REP}.npy"
-            os.mkdir(directory_name)
+            os.makedirs(directory_name, exist_ok=True)
             np.save(dfilename, np.array(torch.load(histname)['dist_history']))
             nfilename = f"results/satellite/nevals_REP_{REP}.npy"
             np.save(nfilename, np.array(torch.load(histname)['num_evals']))
