@@ -15,7 +15,7 @@ from acquisition import _get_acq_func
 from utils import unstandardize
 
 # def active_learning_loop(model, train_x_mt, train_y_mt, problem, acq_method, maxiters=20, disp=True, save_hist=None, log_hyperparams=False):
-def active_learning_loop(trained_gp, acq_method, maxiters=20, disp=True, save_hist: tuple[torch.Tensor, str, str] = None, log_hyperparams=False):
+def active_learning_loop(trained_gp, acq_method, maxiters=20, disp=True, save_hist: tuple[torch.Tensor, str, str] = None, log_hyperparams=False, rep_count=None):
     # unpack results structure
     model = trained_gp.model
     train_x = trained_gp.train_x # has shape ntrain x d+1
@@ -50,6 +50,7 @@ def active_learning_loop(trained_gp, acq_method, maxiters=20, disp=True, save_hi
         truth_from = save_hist[2]
         num_evals = [train_y.numel()]
         dist_history = []
+        intersection_history = torch.empty(0,dim)
 
     
         # Run OpenMDAO problem from test function
@@ -58,7 +59,7 @@ def active_learning_loop(trained_gp, acq_method, maxiters=20, disp=True, save_hi
                 assert(input_vec.size(0)==input_dim)
                 truth_list = torch.vstack((truth_list, problem.from_OpenMDAO(input_vec)))
 
-        update_history_list(dist_history, trained_gp, input_list, truth_list)
+        intersection_history = update_history_list(dist_history, intersection_history, trained_gp, input_list, truth_list)
 
     for i in range(maxiters):
         new_x = acq_func(model, problem)
@@ -107,10 +108,17 @@ def active_learning_loop(trained_gp, acq_method, maxiters=20, disp=True, save_hi
 
         fit_gpytorch_mll(mt_mll)
 
+        # DEBUG: SAVE ALL INCREMENTAL MODELS
         if log_hyperparams:
-            os.makedirs('log', exist_ok=True)
-            hyperparams = model.state_dict()
-            torch.save(hyperparams, 'log/hyperparams_iter' + str(i+1) + '.pt')
+            if rep_count is None: raise ValueError("Need to specify iteration counter") 
+            gp_snapshot = {
+                "model":model,
+                "train_x":train_x,
+                "train_y":train_y
+            }
+            directory_name = 'log'
+            os.makedirs(directory_name, exist_ok=True)
+            torch.save(gp_snapshot, directory_name + "/" + f"model_run_{rep_count+1}_iter_{i+1}.pt")    
 
         # Increment evaluation counter. TODO maybe move this closer to where it happens
         num_evals.append(num_evals[-1]+len(task_list))
@@ -118,10 +126,10 @@ def active_learning_loop(trained_gp, acq_method, maxiters=20, disp=True, save_hi
         # Update result
         trained_gp.model = model
         trained_gp.train_x = train_x
-        trained_gp.train_y = train_y
+        trained_gp.train_y = train_y 
 
         if save_hist is not None:
-            update_history_list(dist_history, trained_gp, input_list, truth_list)
+            intersection_history = update_history_list(dist_history, intersection_history, trained_gp, input_list, truth_list)
 
     if disp:
         print('done')  
@@ -129,7 +137,8 @@ def active_learning_loop(trained_gp, acq_method, maxiters=20, disp=True, save_hi
     if save_hist is not None:
         hist = {
             "num_evals" : num_evals, 
-            "dist_history" : torch.tensor(dist_history).reshape(-1,len(input_list))
+            "dist_history" : torch.tensor(dist_history).reshape(-1,len(input_list)),
+            "intersection_history" : intersection_history
             }
         torch.save(hist, filename)
 
@@ -174,23 +183,27 @@ def residual_intersection(x0, trained_gp):
 
     # Scipy bounds
     bounds_norm = torch.tensor([0.,1.]).reshape(-1,1).repeat(1,dim)
-    bounds_norm[:,:input_dim] = x0[:input_dim]
+    # Set design vars in bounds. Assumes convention that design vars come before coupling vars.
+    bounds_norm[:,:input_dim] = x0[:input_dim] 
+    # Remove bounds on coupling variables, allowing intersection point to be outside of training range.
+    # (reduces dependency on knowledge of problem structure)
+    bounds_norm[:,input_dim:] = torch.tensor([-np.inf, np.inf]).reshape(-1,1) 
     bounds_scipy = Bounds(bounds_norm[0,:], bounds_norm[1,:])
 
-    # res = minimize(convergence_obj_scipy, x0,
-    #                method='L-BFGS-B',
-    #                args=(y, model), 
-    #                jac=convergence_obj_grad_scipy,
-    #                options={'ftol': 1e-8},
-    #                bounds=bounds_scipy)
-
     res = minimize(convergence_obj_scipy, x0,
-                   method='BFGS',
+                   method='L-BFGS-B',
                    args=(y, model), 
                    jac=convergence_obj_grad_scipy,
-                   tol=1e-8
-                   # options={'tol': 1e-8}
-                  )
+                   options={'ftol': 1e-8},
+                   bounds=bounds_scipy)
+
+    # res = minimize(convergence_obj_scipy, x0,
+    #                method='BFGS',
+    #                args=(y, model), 
+    #                jac=convergence_obj_grad_scipy,
+    #                tol=1e-8
+    #                # options={'tol': 1e-8}
+    #               )
     
     return unnormalize(torch.tensor(res.x), bounds)
     # return torch.tensor(res.x)
@@ -198,7 +211,7 @@ def residual_intersection(x0, trained_gp):
 def convergence_dist(u_candidate, truth):
     return torch.sum((u_candidate - truth)**2)**0.5
 
-def update_history_list(dist_history, trained_gp, input_list, truth_list):
+def update_history_list(dist_history, intersection_history, trained_gp, input_list, truth_list):
     problem = trained_gp.problem
     bounds = problem.bounds
     dim = problem.dim
@@ -212,3 +225,5 @@ def update_history_list(dist_history, trained_gp, input_list, truth_list):
         u_candidate = x_candidate[input_dim:]
     
         dist_history.append(convergence_dist(u_candidate, truth).numpy().item())
+        intersection_history = torch.vstack((intersection_history,x_candidate))
+    return intersection_history
