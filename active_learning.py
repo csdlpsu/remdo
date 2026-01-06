@@ -191,7 +191,7 @@ def residual_intersection(x0, trained_gp):
     bounds_scipy = Bounds(bounds_norm[0,:], bounds_norm[1,:])
 
     res = minimize(convergence_obj_scipy, x0,
-                   method='L-BFGS-B',
+                   method='SLSQP',
                    args=(y, model), 
                    jac=convergence_obj_grad_scipy,
                    options={'ftol': 1e-8},

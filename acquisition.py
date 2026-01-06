@@ -15,8 +15,12 @@ from utils import func_grad, func_scipy
 def z(x, model):
     return model.likelihood(model(x)).mean / model.likelihood(model(x)).stddev
 
+# TODO: convert the following acquisition functions to classes; extend a single parent class.
+# Acquisition functions should be in maximization form.
+
+# entropy acquisition function.
 # Inputs:
-#     x       | input to model, n x (d+1) tensor 
+#     x       | input to model, n x (d+1) tensor (normalized)
 #     model   | botorch multitask GP model
 # Outputs:
 #     entropy, n x 1 tensor   
@@ -24,6 +28,26 @@ def entropy(x, model):
     norm = Normal(0.,1.)
     return -norm.cdf(z(x,model))*torch.log(torch.maximum(torch.tensor(0.01),norm.cdf(z(x,model)))) - norm.cdf(1.0-z(x,model))*torch.log(1.01-torch.maximum(torch.tensor(0.01),norm.cdf(z(x,model))))
 
+# maximin distance acquisition function.
+# Inputs:
+#     x      | input to model, n x (d+1) tensor (normalized)
+#     model  | botorch multitask GP model
+# Outputs:
+#     minimum distances, n x 1 tensor (normalized)
+def maximin(x, model):
+    if x.dim() == 1:
+        x = x.unsqueeze(0) # fix input dimensionality
+        
+    train_x = model.train_inputs[0] # Get all existing training points from GP model (normalized)
+    task_mask = (train_x[:,-1] == torch.unique(x[...,-1])) # Filter training points for current task only (assumes only one task)
+    train_x_masked = train_x[task_mask] # training points for current task (normalized)
+    
+    min_dists = torch.zeros(x.size(0)) # preallocate output list
+    for index, x_single in enumerate(x):
+        dists = torch.sum((x_single - train_x_masked)**2, dim=1)**0.5
+        min_dists[index] = torch.min(dists)
+
+    return min_dists
 
 
 # Entropy search - maximize value of entropy
@@ -38,7 +62,8 @@ def entropy(x, model):
 # Outputs:
 #     1 x d un-normalized tensor of input that results in max acquisition value
 #     
-def optimize_acquisition(model, problem, task_no, acqf, num_samples = 1000, specify_input: list = None):
+def optimize_acquisition(model, problem, task_no, acqf, method: str = 'L-BFGS-B', 
+                         num_samples = 1000, specify_input: list = None):
     bounds = problem.bounds
     d = bounds.size(1)
 
@@ -73,7 +98,7 @@ def optimize_acquisition(model, problem, task_no, acqf, num_samples = 1000, spec
         return -func_scipy(func_grad(acqf))(x, model)
 
     res = minimize(neg_acqf, torch.cat((x0,torch.tensor([task_no]))),
-                   method='L-BFGS-B', 
+                   method=method, 
                    args=model, 
                    jac=neg_acqf_grad,
                    # options={'xatol': 1e-8, 'disp': True}, 
@@ -149,7 +174,7 @@ def optimize_acquisition(model, problem, task_no, acqf, num_samples = 1000, spec
 # Outputs:
 #     func   | multitask acquisition function callable.
 '''
-def multitask_acquisition(acqf):
+def multitask_acquisition(acqf, method):
     def func(model, problem, disp=False):
         task_list = problem.tasks
         bounds = problem.bounds
@@ -161,7 +186,7 @@ def multitask_acquisition(acqf):
         # Store optimal points
         X_maximizer = torch.empty(len(task_list),d)
         for ind, task_id in enumerate(task_list):
-            x_optim, _ = optimize_acquisition(model, problem, task_id, acqf)
+            x_optim, _ = optimize_acquisition(model, problem, task_id, acqf, method)
     
             # Add optimizer x to return list
             X_maximizer[ind,:] = x_optim
@@ -171,8 +196,10 @@ def multitask_acquisition(acqf):
 
 # def joint_acquisition(model, problem, acqf, disp=False):
 
-def _get_acq_func(method_name):
-    if method_name == 'entropy':
-        return multitask_acquisition(entropy)
+def _get_acq_func(acquisition_name):
+    if acquisition_name == 'entropy':
+        return multitask_acquisition(entropy, method='L-BFGS-B')
+    elif acquisition_name == 'maximin':
+        return multitask_acquisition(maximin, method='COBYQA')
     else:
-        raise ValueError("Acquisition function '" + method_name + "' undefined.")
+        raise ValueError("Acquisition function '" + acquisition_name + "' undefined.")
