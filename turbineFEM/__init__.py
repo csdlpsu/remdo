@@ -16,7 +16,7 @@ import weakref
 
 class _PathInitializer(object):
     PLATFORM_DICT = {'Windows': ['PATH','dll',''], 'Linux': ['LD_LIBRARY_PATH','so','libmw'], 'Darwin': ['DYLD_LIBRARY_PATH','dylib','libmw']}
-    SUPPORTED_PYTHON_VERSIONS = ['3_9', '3_10', '3_11', '3_12', '3_13'] # manually added python 3.13
+    SUPPORTED_PYTHON_VERSIONS = ['3_9', '3_10', '3_11', '3_12', '3_13'] # manually add python 3.13
     RUNTIME_VERSION_W_DOTS = '24.2'
     RUNTIME_VERSION_W_UNDERSCORES = '24_2'
     PACKAGE_NAME = 'turbineFEM'
