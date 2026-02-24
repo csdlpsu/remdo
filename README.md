@@ -1,5 +1,8 @@
 # Surrogate MDO
-Application of GP surrogate model to systems with coupled disciplines
+Application of GP surrogate model to systems with coupled disciplines.
+
+# Turbine FEM requirements
+Running the turbine test function example requires [MATLAB Runtime 2024b](https://www.mathworks.com/products/compiler/matlab-runtime.html) to be installed and added to the system path.
 
 # Review comments (delete after implementing changes)
 - Start by providing instructions to install the code -- users should be able to simply copy and paste the command to get it to work
