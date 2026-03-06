@@ -31,7 +31,7 @@ def train_multitask_gp(problem, num_train=10, seed=None, disp=True):
     # Add task numbers
     train_x_mt = torch.column_stack([train_x.repeat(ntasks,1), 
                                      torch.tensor(problem.tasks).repeat(num_train,1).transpose(0,1).reshape(-1,1)])
-    bounds_task = torch.column_stack([bounds, torch.tensor(task_list)])
+    bounds_task = torch.column_stack([bounds, torch.tensor( [min(task_list), max(task_list)] ) ])
     
     # Evaluate residuals
     problem.set_vars(train_x)

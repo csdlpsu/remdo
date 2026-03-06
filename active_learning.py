@@ -24,7 +24,8 @@ def active_learning_loop(trained_gp, acq_method, maxiters=20, disp=True, save_hi
     
     task_list = problem.tasks
     bounds = problem.bounds
-    bounds_task = torch.column_stack([bounds, torch.tensor(task_list)])
+    # bounds_task = torch.column_stack([bounds, torch.tensor(task_list)])
+    bounds_task = torch.column_stack([bounds, torch.tensor( [min(task_list), max(task_list)] ) ])
     dim = problem.dim
     input_dim = problem.input_dim
     coupling_dim = problem.coupling_dim
@@ -121,7 +122,8 @@ def active_learning_loop(trained_gp, acq_method, maxiters=20, disp=True, save_hi
             torch.save(gp_snapshot, directory_name + "/" + f"model_run_{rep_count+1}_iter_{i+1}.pt")    
 
         # Increment evaluation counter. TODO maybe move this closer to where it happens
-        num_evals.append(num_evals[-1]+len(task_list))
+        if save_hist is not None:
+            num_evals.append(num_evals[-1]+len(task_list))
 
         # Update result
         trained_gp.model = model
@@ -138,7 +140,8 @@ def active_learning_loop(trained_gp, acq_method, maxiters=20, disp=True, save_hi
         hist = {
             "num_evals" : num_evals, 
             "dist_history" : torch.tensor(dist_history).reshape(-1,len(input_list)),
-            "intersection_history" : intersection_history
+            "intersection_history" : intersection_history,
+            "truth_list" : truth_list
             }
         torch.save(hist, filename)
 
@@ -150,24 +153,30 @@ def active_learning_loop(trained_gp, acq_method, maxiters=20, disp=True, save_hi
     
 
 # Track convergence history
-def convergence_obj(x, y, model):
-    pred1 = unstandardize(model.likelihood(model(torch.column_stack([x, torch.zeros(1)]))), y[:,0])
-    pred2 = unstandardize(model.likelihood(model(torch.column_stack([x, torch.ones(1)]))), y[:,1])
-    return (pred1.mean**2) + (pred2.mean**2)
+def convergence_obj(x, y, model, problem):
+    tasks = problem.tasks
+    obj = 0
+    for task in tasks:
+        pred = unstandardize(model.likelihood(model(torch.column_stack([x, torch.ones(1)*task]))), y[:,task])
+        obj += pred.mean**2
+    return obj
+    # pred1 = unstandardize(model.likelihood(model(torch.column_stack([x, torch.zeros(1)]))), y[:,0])
+    # pred2 = unstandardize(model.likelihood(model(torch.column_stack([x, torch.ones(1)]))), y[:,1])
+    # return (pred1.mean**2) + (pred2.mean**2)
 
-def convergence_obj_scipy(x, y, model):
+def convergence_obj_scipy(x, y, model, problem):
     x_tens = torch.tensor(x).unsqueeze(0)
-    return convergence_obj(x_tens, y, model).squeeze().detach().numpy()
+    return convergence_obj(x_tens, y, model, problem).squeeze().detach().numpy()
 
-def convergence_obj_grad(x, y, model):
+def convergence_obj_grad(x, y, model, problem):
     x.requires_grad = True
-    x_conv = convergence_obj(x, y, model)
+    x_conv = convergence_obj(x, y, model, problem)
     x_conv.backward(torch.ones_like(x_conv))
     return x.grad
 
-def convergence_obj_grad_scipy(x, y, model):
+def convergence_obj_grad_scipy(x, y, model, problem):
     x_tens = torch.tensor(x).unsqueeze(0)
-    return convergence_obj_grad(x_tens, y, model).squeeze().detach().numpy().astype(np.float64)
+    return convergence_obj_grad(x_tens, y, model, problem).squeeze().detach().numpy().astype(np.float64)
 
 # assume x and input are pre-scaled
 def residual_intersection(x0, trained_gp):
@@ -191,8 +200,8 @@ def residual_intersection(x0, trained_gp):
     bounds_scipy = Bounds(bounds_norm[0,:], bounds_norm[1,:])
 
     res = minimize(convergence_obj_scipy, x0,
-                   method='SLSQP',
-                   args=(y, model), 
+                   method='L-BFGS-B',
+                   args=(y, model, problem), 
                    jac=convergence_obj_grad_scipy,
                    options={'ftol': 1e-8},
                    bounds=bounds_scipy)
@@ -223,7 +232,11 @@ def update_history_list(dist_history, intersection_history, trained_gp, input_li
         x0 = torch.cat((input_vec, truth))
         x_candidate = residual_intersection(x0, trained_gp)
         u_candidate = x_candidate[input_dim:]
+        # print(bounds)
+        # print(u_candidate)
     
-        dist_history.append(convergence_dist(u_candidate, truth).numpy().item())
+        # dist_history.append(convergence_dist(u_candidate, truth).numpy().item()) # not normalized
+        dist_history.append(convergence_dist(normalize(u_candidate, bounds[:,input_dim:]), 
+                                             normalize(truth, bounds[:,input_dim:])).numpy().item()) # normalized
         intersection_history = torch.vstack((intersection_history,x_candidate))
     return intersection_history
