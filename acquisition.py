@@ -27,6 +27,7 @@ def z(x, model):
 def entropy(x, model):
     norm = Normal(0.,1.)
     return -norm.cdf(z(x,model))*torch.log(torch.maximum(torch.tensor(0.01),norm.cdf(z(x,model)))) - norm.cdf(1.0-z(x,model))*torch.log(1.01-torch.maximum(torch.tensor(0.01),norm.cdf(z(x,model))))
+    # return -norm.cdf(z(x,model))*torch.log(norm.cdf(z(x,model))) - norm.cdf(1.0-z(x,model))*torch.log(1.01-norm.cdf(z(x,model)))
 
 # maximin distance acquisition function.
 # Inputs:

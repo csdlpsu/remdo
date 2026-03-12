@@ -46,3 +46,31 @@ def sample_in_bounds(bounds: torch.Tensor, num_samples, specify_input: list = No
                                        samples ))
         
     return samples
+
+# Generates evenly spaced test points within problem bounds.
+# Output is unnormalized.
+def assemble_test_points(problem, tasks_to_plot, input_vec, npts):
+    assert len(tasks_to_plot)==2, "Plotting requires exactly two tasks."
+    assert set(tasks_to_plot).issubset(problem.tasks), "Tasks must be associated with problem."
+
+    truth = problem.from_OpenMDAO(input_vec)
+    
+    bounds = problem.bounds
+    coupling_dim = problem.coupling_dim
+    coupling_bounds_full = bounds[:, -coupling_dim:]
+    coupling_bounds = torch.stack((coupling_bounds_full[:,tasks_to_plot[0]], 
+                                   coupling_bounds_full[:,tasks_to_plot[1]]))
+    # non_tasks = list(set(problem.tasks)-set(tasks))
+
+    # Generate npts**2 probe points
+    xvec, yvec = torch.meshgrid(torch.linspace(*coupling_bounds[0,:],npts), # first coupling variable
+                                torch.linspace(*coupling_bounds[1,:],npts), # second coupling variable
+                                indexing='ij')
+
+    coupling_points = truth.tile(npts**2, 1) # repeat truth vector to match probe points
+    for task, vec in zip(tasks_to_plot, [xvec, yvec]):
+        coupling_points[:,task] = vec.ravel()
+
+    test_points = torch.column_stack((input_vec.repeat(npts**2,1), coupling_points))
+    
+    return test_points, xvec, yvec

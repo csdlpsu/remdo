@@ -12,11 +12,30 @@ from botorch.optim.fit import fit_gpytorch_mll_torch
 from botorch.exceptions.warnings import OptimizationWarning
 
 class TrainedGP:
-    def __init__(self, problem, model, x, y):
+    def __init__(self, problem=None, model=None, x=None, y=None):
         self.model = model
         self.problem = problem
         self.train_x = x
         self.train_y = y    
+
+    def save(self, filename):
+        model_dict = {
+            "model" : self.model,
+            "problem" : type(self.problem),
+            "train_x" : self.train_x,
+            "train_y" : self.train_y
+        }
+        torch.save(model_dict, filename)
+        return
+
+    def load(self, filename):
+        model_dict = torch.load(filename, weights_only=False)
+        self.model = model_dict["model"]
+        self.train_x = model_dict["train_x"]
+        self.train_y = model_dict["train_y"]
+        # Get problem type and create a new object
+        self.problem = model_dict["problem"]()
+        return
 
 def train_multitask_gp(problem, num_train=10, seed=None, disp=True): 
     bounds = problem.bounds
@@ -70,7 +89,13 @@ def train_multitask_gp(problem, num_train=10, seed=None, disp=True):
     torch.save(hyperparams, 'hyperparams.pt')
 
     result = TrainedGP(problem, mt_model, train_x_mt, train_y)
-    
+    # result = {
+    #     "problem" : problem,
+    #     "model" : mt_model,
+    #     "train_x" : train_x_mt,
+    #     "train_y" : train_y
+    # }
+
     return result
 
 
@@ -107,6 +132,11 @@ def train_model_list_gp(problem, num_train=10, seed=None, disp=True):
     hyperparams = mt_model.state_dict()
     torch.save(hyperparams, 'hyperparams.pt')
 
-    result = TrainedGP(problem, mt_model, train_x, train_y)
-    
+    # result = TrainedGP(problem, mt_model, train_x_mt, train_y)
+    result = {
+        "problem" : problem,
+        "model" : mt_model,
+        "train_x" : train_x_mt,
+        "train_y" : train_y
+    }    
     return result
