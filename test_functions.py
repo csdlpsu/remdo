@@ -672,6 +672,8 @@ class Turbine(MDA):
         self._coupling_dim = 4
         self._tasks = [0, 1, 2, 3]
 
+        self._residual_mode = 'all'
+
         # set up MATLAB
         import turbineFEM
         import matlab
@@ -745,9 +747,36 @@ class Turbine(MDA):
 
         return self._recon - (Fecon*self._tfail*self._Peng*(c0/1000))
 
+    def set_res_mode(self, mode):
+        allowed_modes = ['all', 'diagonal']
+        if mode in allowed_modes:
+            self._residual_mode = mode
+        return
+
     @property
     def res(self):
-        return torch.column_stack([self.r1, self.r2, self.r3, self.r4])
+        if self._residual_mode == 'all':
+            return torch.column_stack([self.r1, self.r2, self.r3, self.r4])
+        # Workaround for slow res. Consider implementing a more universal solution.
+        elif self._residual_mode == 'diagonal': 
+            # Store current inputs
+            x = torch.column_stack((self._x, self._Tbulk, self._tfail, self._Peng, self._recon))
+            assert len(x) == self._coupling_dim
+
+            # List of residual functions
+            res_func_list = [Turbine.r1.fget, Turbine.r2.fget, Turbine.r3.fget, Turbine.r4.fget]
+            res_out_list = []
+
+            # Compute one residual for each input row
+            for row, res_func in zip(x, res_func_list):
+                self.set_vars(row.unsqueeze(0))
+                res_out_list.append(res_func(self))
+
+            # Set inputs back to what they were before
+            self.set_vars(x)
+
+            # Return the 4 residuals as a diagonal matrix
+            return torch.diag(torch.tensor(res_out_list))
 
     def set_vars(self, x) -> None:
         if x.shape[1] != 15:
@@ -757,6 +786,7 @@ class Turbine(MDA):
         self._tfail = x[:,-3]
         self._Peng = x[:,-2]
         self._recon = x[:,-1]
+        return
 
     def set_bounds(self, bounds) -> None:
         if bounds.shape[1] != 15 or bounds.shape[0] != 2:

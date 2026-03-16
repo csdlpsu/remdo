@@ -13,6 +13,7 @@ import numpy as np
 import os
 from acquisition import _get_acq_func
 from utils import unstandardize
+import time
 
 # def active_learning_loop(model, train_x_mt, train_y_mt, problem, acq_method, maxiters=20, disp=True, save_hist=None, log_hyperparams=False):
 def active_learning_loop(trained_gp, acq_method, maxiters=20, disp=True, save_hist: tuple[torch.Tensor, str, str] = None, log_hyperparams=False, rep_count=None):
@@ -69,7 +70,9 @@ def active_learning_loop(trained_gp, acq_method, maxiters=20, disp=True, save_hi
         # Currently this calculates all residuals for all new x points. 
         # This results in extra evaluations.
         # Fine for now since the function is inexpensive, but needs to be looked at in the future.
+        # t = time.time()
         new_y = torch.diagonal(problem.res)
+        # print(f"Residual time: {time.time()-t}")
                 
         if disp:
             print(f"Iter {i+1}")
@@ -101,6 +104,7 @@ def active_learning_loop(trained_gp, acq_method, maxiters=20, disp=True, save_hi
         train_y_mt = standardize(train_y).transpose(0,1).reshape(-1,1)
 
         # Train GP
+        # t = time.time()
         model = MultiTaskGP(train_x,train_y_mt,task_feature=-1,
                             input_transform=Normalize(d=dim+1,bounds=bounds_task,indices=list(range(0,dim))),
                             # outcome_transform=Standardize(m=1))
@@ -108,6 +112,7 @@ def active_learning_loop(trained_gp, acq_method, maxiters=20, disp=True, save_hi
         mt_mll = ExactMarginalLogLikelihood(model.likelihood, model)
 
         fit_gpytorch_mll(mt_mll)
+        # print(f"Training time: {time.time()-t}")
 
         # DEBUG: SAVE ALL INCREMENTAL MODELS
         if log_hyperparams:
@@ -199,13 +204,14 @@ def residual_intersection(x0, trained_gp):
     bounds_norm[:,input_dim:] = torch.tensor([-np.inf, np.inf]).reshape(-1,1) 
     bounds_scipy = Bounds(bounds_norm[0,:], bounds_norm[1,:])
 
+    # t=time.time()
     res = minimize(convergence_obj_scipy, x0,
                    method='L-BFGS-B',
                    args=(y, model, problem), 
                    jac=convergence_obj_grad_scipy,
-                   options={'ftol': 1e-8},
+                   # options={'ftol': 1e-4, 'gtol': 1e-3},
                    bounds=bounds_scipy)
-
+    # print(f"Intersection time: {time.time()-t}")
     # res = minimize(convergence_obj_scipy, x0,
     #                method='BFGS',
     #                args=(y, model), 
