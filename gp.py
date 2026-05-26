@@ -39,6 +39,30 @@ class TrainedGP:
         return
 
 def train_multitask_gp(problem, num_train=10, seed=None, disp=True, specify_mean=0.): 
+    """
+    Train a multi-task Gaussian Process (GP) model using Latin Hypercube sampling.
+
+    This function generates training data across multiple tasks defined in
+    the given problem, fits a MultiTaskGP model, and returns a wrapped object
+    containing the trained model and datasets.
+
+    Args:
+        problem: Problem instance providing required attributes and methods.
+        num_train (int, optional): Number of training samples per task.
+            Defaults to 10.
+        seed (int or None, optional): Random seed for reproducibility of the
+            Latin Hypercube sampler. Defaults to None.
+        disp (bool, optional): Display flag (currently unused). Defaults to True.
+        specify_mean (float, optional): Mean value used during output
+            standardization. Defaults to 0.
+
+    Returns:
+        TrainedGP: A wrapper object containing:
+            - problem: Original problem instance.
+            - model: Trained MultiTaskGP model.
+            - train_x_per_task: List of input tensors grouped by task.
+            - train_y_per_task: List of output tensors grouped by task.
+    """
     bounds = problem.bounds
     dim = problem.dim
     task_list = problem.tasks
@@ -52,12 +76,10 @@ def train_multitask_gp(problem, num_train=10, seed=None, disp=True, specify_mean
     train_x_mt = torch.column_stack([train_x.repeat(ntasks,1), 
                                      torch.tensor(problem.tasks).repeat(num_train,1).transpose(0,1).reshape(-1,1)])
     train_x_per_task = list(torch.split(train_x_mt, num_train))
-    # print(train_x_per_task)
-    # dog = torch.empty(0,dim+1)
-    # for tens in train_x_per_task:
-    #     dog = torch.vstack((dog, tens))
-    # print(dog)
-    
+
+    # Augment bounds with an extra column to match input dimensions
+    # (TODO: the value of the added elements doesn't really matter,
+    # since it is ignored in normalization. Can be improved)
     bounds_task = torch.column_stack([bounds, torch.tensor( [min(task_list), max(task_list)] ) ])
     
     # Evaluate residuals
@@ -65,33 +87,12 @@ def train_multitask_gp(problem, num_train=10, seed=None, disp=True, specify_mean
     train_y = problem.res # tensor with shape num_train x ntasks
     train_y_mt = standardize(train_y, specify_mean=specify_mean).transpose(0,1).reshape(-1,1)
 
-    # mt_model = MultiTaskGP(normalize(train_x_mt, bounds_task), standardize(train_y_mt), task_feature=-1,)
-                           # input_transform=Normalize(d=dim+1, bounds=bounds_task, indices=list(range(0,dim+1))),
-                           # outcome_transform=Standardize(m=1))
-
     mt_model = MultiTaskGP(train_x_mt, train_y_mt, task_feature = -1,
                            input_transform = Normalize(d=dim+1, bounds=bounds_task, indices=list(range(0,dim))),
                            outcome_transform = None)
     
     mt_mll = ExactMarginalLogLikelihood(mt_model.likelihood, mt_model)
     fit_gpytorch_mll(mt_mll)
-
-    # warnings.filterwarnings("error", category=OptimizationWarning)
-
-    # try:
-    #     mt_mll = ExactMarginalLogLikelihood(mt_model.likelihood, mt_model)
-    #     fit_gpytorch_mll(mt_mll)
-    # except OptimizationWarning:
-    #     if disp:
-    #         print("GP fitting failed. Retrying using Adam...")
-    #     mt_mll = ExactMarginalLogLikelihood(mt_model.likelihood, mt_model)
-    #     fit_gpytorch_mll(mt_mll, optimizer=fit_gpytorch_mll_torch)
-
-    # mt_mll = ExactMarginalLogLikelihood(mt_model.likelihood, mt_model)
-    # fit_gpytorch_mll(mt_mll)
-    # fit_gpytorch_mll(mt_mll, optimizer=fit_gpytorch_mll_torch)
-
-    # warnings.filterwarnings("default")
 
     hyperparams = mt_model.state_dict()
     torch.save(hyperparams, 'hyperparams.pt')

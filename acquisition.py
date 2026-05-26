@@ -125,125 +125,52 @@ def optimize_acquisition(model, problem, acqf, task_no = None, method: str = 'L-
     else: 
         return unnormalize(torch.tensor(res.x),bounds), -torch.tensor(res.fun)
 
-# # Sequence acquisition function optimization for multiple tasks
-# # Also handles results visualization
-# # Inputs: 
-# #     model      | botorch model
-# #     task_list  | list of t task numbers for which to find entropy
-# #     bounds     | 2 x d bounds tensor; first row is low, second row is high
-# #                | where d is the number of dimensions. NO TASK INDICATOR
-# # Outputs:
-# #     X_max_ent  | t x d tensor of sample points with highest entropy. NO TASK INDICATOR
-# def multitask_acquisition(model, problem, acqf, disp=False):
-#     task_list = problem.tasks
-#     bounds = problem.bounds
-#     # input_vec = torch.ones(5) # HARD CODED FOR RESULTS VISUALIZATION
-
-#     d = bounds.size(1) # input dimensions
-
-#     ## OPTIMIZE ENTROPY FOR EACH RESIDUAL
-#     # Store optimal points
-#     X_maximizer = torch.empty(len(task_list),d)
-#     for ind, task_id in enumerate(task_list):
-#         x_optim, _ = optimize_acquisition(model, problem, task_id, acqf)
-
-#         # Add optimizer x to return list
-#         X_maximizer[ind,:] = x_optim
-    
-#     ## PLOT RESULTS
-#     # if disp:
-#     #     # entropy contour
-#     #     npoints = 50
-#     #     xv, yv = torch.meshgrid(torch.linspace(6.,12.,npoints), torch.linspace(6.,20.,npoints))
-#     #     in_vec_r1 = X_max_ent[0,:5]
-#     #     xyvec_r1 = torch.column_stack([in_vec_r1.repeat(npoints**2,1),xv.reshape(-1,1),yv.reshape(-1,1)])
-#     #     xyvec_r1 = normalize(xyvec_r1, bounds)
-#     #     xyvec_r1 = torch.column_stack([xyvec_r1, torch.ones(npoints**2,1) * 0])
-#     #     in_vec_r2 = X_max_ent[1,:5]
-#     #     xyvec_r2 = torch.column_stack([in_vec_r2.repeat(npoints**2,1),xv.reshape(-1,1),yv.reshape(-1,1)])
-#     #     xyvec_r2 = normalize(xyvec_r2, bounds)
-#     #     xyvec_r2 = torch.column_stack([xyvec_r2, torch.ones(npoints**2,1) * 1])
-#     #     r1_entropy = entropy(xyvec_r1, model)
-#     #     r2_entropy = entropy(xyvec_r2, model)
-    
-#     #     # Plot result at each iteration
-#     #     fig = plt.figure(figsize=(12,4))
-#     #     ax1 = fig.add_subplot(121)
-#     #     er1 = ax1.contourf(xv,yv,r1_entropy.detach().reshape(npoints,npoints))
-#     #     # ax1.scatter(X_samples[:,-2],X_samples[:,-1], c='k', s=8)
-#     #     fig.colorbar(er1)
-#     #     ax2 = fig.add_subplot(122)
-#     #     er2 = ax2.contourf(xv,yv,r2_entropy.detach().reshape(npoints,npoints))
-#     #     # ax2.scatter(X_samples[:,-2],X_samples[:,-1], c='k', s=8)
-#     #     fig.colorbar(er2)
-    
-#     #     ax1.scatter(X_max_ent[0,-2],X_max_ent[0,-1], c='r')
-#     #     ax2.scatter(X_max_ent[1,-2],X_max_ent[1,-1], c='r')
-#     #     plt.show()
-        
-#     return X_maximizer
-
-'''
-# Converts single-task acquisition function into multi-task by sequencing the original function for each task.
-# Returns a new function.
-# Also handles results visualization for now
-# Inputs: 
-#     acqf   | original acquisition function callable.
-# Outputs:
-#     func   | multitask acquisition function callable.
-'''
-# def multitask_acquisition(acqf, method):
-#     def func(model, problem, disp=False):
-#         task_list = problem.tasks
-#         bounds = problem.bounds
-#         # input_vec = torch.ones(5) # HARD CODED FOR RESULTS VISUALIZATION
-    
-#         d = bounds.size(1) # input dimensions
-    
-#         ## OPTIMIZE ENTROPY FOR EACH RESIDUAL
-#         # Store optimal points
-#         X_maximizer = torch.empty(len(task_list),d)
-#         for ind, task_id in enumerate(task_list):
-#             x_optim, _ = optimize_acquisition(model, problem, task_id, acqf, method)
-    
-#             # Add optimizer x to return list
-#             X_maximizer[ind,:] = x_optim
-            
-#         return X_maximizer
-#     return func
-
 def multitask_acquisition(acqf, method):
+    """
+    Create a multitask acquisition function optimizer wrapper.
+
+    This function returns a callable that optimizes a given acquisition
+    function independently for each task in a multi-task problem, collecting
+    the best candidate point per task.
+
+    Args:
+        acqf: Acquisition function to be optimized. This function is passed
+            to the underlying optimization routine.
+        method: Optimization method used by ``optimize_acquisition``.
+
+    Returns:
+        callable: A function with signature ``func(model, problem, disp=False)``
+        that performs acquisition optimization across all tasks.
+
+            The returned function accepts:
+                model: Trained GP model used for acquisition evaluation.
+                problem: Problem instance that must provide:
+                    - tasks (list or iterable): Task identifiers.
+                    - bounds (torch.Tensor): Tensor of shape (2, d) defining input bounds.
+                disp (bool, optional): Display flag (currently unused).
+                    Defaults to False.
+
+            Returns:
+                list: A list of tensors where each element is the optimal input
+                point (maximizer of the acquisition function) for a corresponding task.
+
+    Notes:
+        - The acquisition function is optimized independently for each task.
+        - Internally, ``optimize_acquisition`` is called for each task ID.
+        - The returned list preserves the order of tasks defined in the problem.
+    """
     def func(model, problem, disp=False):
         task_list = problem.tasks
         bounds = problem.bounds
-        # input_vec = torch.ones(5) # HARD CODED FOR RESULTS VISUALIZATION
     
         d = bounds.size(1) # input dimensions
-
-        # THRESHOLD = 1e-2
     
         ## OPTIMIZE ENTROPY FOR EACH RESIDUAL
         # Store optimal points
-        # X_maximizer = torch.empty(len(task_list),d)
         X_maximizer = []
         for ind, task_id in enumerate(task_list):
             x_optim, _ = optimize_acquisition(model, problem, acqf, task_id, method)
 
-            # # Check distance to existing training points.
-            # train_x_normalized = model.train_inputs[0]
-            # existing_x = train_x_normalized[train_x_normalized[:,-1] == task_id][:,:-1] # Mask inputs matching task_id
-            # dists = torch.sum( (existing_x - normalize(x_optim,bounds) )**2, axis=1)**0.5
-
-            # # If new point is too close, pick a random point instead
-            # if any(dists) < THRESHOLD:
-            #     X_maximizer[ind,:] = sample_in_bounds(bounds, 1)
-            #     print('threshold distance hit! using random point.')
-    
-            # # Otherwise add optimizer x to return list
-            # else:
-            #     X_maximizer[ind,:] = x_optim
-
-            # X_maximizer[ind,:] = x_optim
             X_maximizer.append(x_optim)
             
         return X_maximizer
