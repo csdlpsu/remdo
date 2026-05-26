@@ -56,6 +56,30 @@ class turbineLifetime(om.ExplicitComponent):
 
         outputs['tfail'] = np.exp(Plm/Tbulk - 20)
 
+class turbineLifetime_modified(om.ExplicitComponent):
+    def setup(self):
+        # Global design variable
+        # [Tc1, Tc2, Tc3, K, hle, hte, Plm, mdot, Tg, Fperf, Fecon]
+        self.add_input('x', val=np.ones(11)) 
+
+        # Coupling parameter
+        self.add_input('Tbulk', val=1000.)
+        self.add_input('Peng', val=5.0e6)
+
+        # Coupling output
+        self.add_output('tfail', val=1000.)
+
+    def setup_partials(self):
+        # Finite difference all partials
+        self.declare_partials('*', '*', method='cs')
+
+    def compute(self, inputs, outputs):
+        Plm = inputs['x'][6]
+        Tbulk = inputs['Tbulk']
+        Peng = inputs['Peng']
+
+        outputs['tfail'] = np.exp(Plm/Tbulk - 20 + 2*(Peng/1e7)**2)
+
 class turbinePerformance(om.ExplicitComponent):
     def setup(self):
         # Global design variable
@@ -79,6 +103,34 @@ class turbinePerformance(om.ExplicitComponent):
         Cp = 1003.5
 
         outputs['Peng'] = Fperf*(mdot0-N*mdot)*Cp*T0*(1+Tg/T0-2*np.sqrt(Tg/T0))
+
+class turbinePerformance_modified(om.ExplicitComponent):
+    def setup(self):
+        # Global design variable
+        # [Tc1, Tc2, Tc3, K, hle, hte, Plm, mdot, Tg, Fperf, Fecon]
+        self.add_input('x', val=np.ones(11)) 
+        self.add_input('recon', val=1.0e4)
+        self.add_input('tfail', val=100)
+
+        # Coupling output
+        self.add_output('Peng', val=5.0e6)
+
+    def setup_partials(self):
+        # Finite difference all partials
+        self.declare_partials('*', '*', method='cs')
+
+    def compute(self, inputs, outputs):
+        mdot, Tg, Fperf = inputs['x'][7], inputs['x'][8], inputs['x'][9]
+        recon = inputs['recon']
+        tfail = inputs['tfail']
+
+        # Constants
+        mdot0 = 30
+        T0 = 300
+        N = 90
+        Cp = 1003.5
+
+        outputs['Peng'] = Fperf*(mdot0-N*mdot)*Cp*T0*(1+Tg/T0-2*np.sqrt(Tg/T0)) + 100*tfail**2 + 0.0001*recon**2
 
 class turbineEconomics(om.ExplicitComponent):
     def setup(self):
@@ -114,3 +166,17 @@ class turbineGroup(om.Group):
         self.add_subsystem('life', turbineLifetime(), promotes=['*'])
         self.add_subsystem('perf', turbinePerformance(), promotes=['*'])
         self.add_subsystem('econ', turbineEconomics(), promotes=['*'])
+
+        self.linear_solver = om.DirectSolver()
+        self.nonlinear_solver = om.NonlinearBlockGS()
+
+class turbineGroup_feedback(om.Group):
+    def setup(self):
+        self.add_subsystem('heat', turbineHeatTransfer(), promotes=['*'])
+        self.add_subsystem('life', turbineLifetime_modified(), promotes=['*'])
+        self.add_subsystem('perf', turbinePerformance_modified(), promotes=['*'])
+        self.add_subsystem('econ', turbineEconomics(), promotes=['*'])
+
+        self.linear_solver = om.DirectSolver()
+        nlbgs=self.nonlinear_solver = om.NonlinearBlockGS()
+        nlbgs.options['maxiter'] = 100

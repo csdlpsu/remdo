@@ -7,16 +7,17 @@ from botorch.models.multitask import MultiTaskGP
 from gpytorch.mlls import ExactMarginalLogLikelihood
 from botorch.fit import fit_gpytorch_mll
 from botorch.models.transforms import Normalize, Standardize
-from botorch.utils.transforms import normalize, unnormalize, standardize
+from botorch.utils.transforms import normalize, unnormalize #, standardize
 from botorch.optim.fit import fit_gpytorch_mll_torch
 from botorch.exceptions.warnings import OptimizationWarning
+from utils import standardize
 
 class TrainedGP:
     def __init__(self, problem=None, model=None, x=None, y=None):
         self.model = model
         self.problem = problem
         self.train_x = x
-        self.train_y = y    
+        self.train_y = y
 
     def save(self, filename):
         model_dict = {
@@ -37,7 +38,7 @@ class TrainedGP:
         self.problem = model_dict["problem"]()
         return
 
-def train_multitask_gp(problem, num_train=10, seed=None, disp=True): 
+def train_multitask_gp(problem, num_train=10, seed=None, disp=True, specify_mean=0.): 
     bounds = problem.bounds
     dim = problem.dim
     task_list = problem.tasks
@@ -50,12 +51,19 @@ def train_multitask_gp(problem, num_train=10, seed=None, disp=True):
     # Add task numbers
     train_x_mt = torch.column_stack([train_x.repeat(ntasks,1), 
                                      torch.tensor(problem.tasks).repeat(num_train,1).transpose(0,1).reshape(-1,1)])
+    train_x_per_task = list(torch.split(train_x_mt, num_train))
+    # print(train_x_per_task)
+    # dog = torch.empty(0,dim+1)
+    # for tens in train_x_per_task:
+    #     dog = torch.vstack((dog, tens))
+    # print(dog)
+    
     bounds_task = torch.column_stack([bounds, torch.tensor( [min(task_list), max(task_list)] ) ])
     
     # Evaluate residuals
     problem.set_vars(train_x)
     train_y = problem.res # tensor with shape num_train x ntasks
-    train_y_mt = standardize(train_y).transpose(0,1).reshape(-1,1)
+    train_y_mt = standardize(train_y, specify_mean=specify_mean).transpose(0,1).reshape(-1,1)
 
     # mt_model = MultiTaskGP(normalize(train_x_mt, bounds_task), standardize(train_y_mt), task_feature=-1,)
                            # input_transform=Normalize(d=dim+1, bounds=bounds_task, indices=list(range(0,dim+1))),
@@ -88,7 +96,7 @@ def train_multitask_gp(problem, num_train=10, seed=None, disp=True):
     hyperparams = mt_model.state_dict()
     torch.save(hyperparams, 'hyperparams.pt')
 
-    result = TrainedGP(problem, mt_model, train_x_mt, train_y)
+    result = TrainedGP(problem, mt_model, train_x_per_task, list(train_y.unbind(dim=1)))
     # result = {
     #     "problem" : problem,
     #     "model" : mt_model,
@@ -102,41 +110,41 @@ def train_multitask_gp(problem, num_train=10, seed=None, disp=True):
 
 
 
-def train_model_list_gp(problem, num_train=10, seed=None, disp=True): 
-    bounds = problem.bounds
-    dim = problem.dim
-    task_list = problem.tasks
-    ntasks = len(task_list)
-    sampler = qmc.LatinHypercube(d=dim, seed=seed)
+# def train_model_list_gp(problem, num_train=10, seed=None, disp=True): 
+#     bounds = problem.bounds
+#     dim = problem.dim
+#     task_list = problem.tasks
+#     ntasks = len(task_list)
+#     sampler = qmc.LatinHypercube(d=dim, seed=seed)
 
-    # Sample design space at num_train points by Latin Hypercube method 
-    train_x = torch.tensor(qmc.scale(sampler.random(n=num_train), bounds[0,:], bounds[1,:]))
+#     # Sample design space at num_train points by Latin Hypercube method 
+#     train_x = torch.tensor(qmc.scale(sampler.random(n=num_train), bounds[0,:], bounds[1,:]))
 
-    # Evaluate residuals
-    problem.set_vars(train_x)
-    train_y = problem.res # tensor with shape num_train x ntasks
+#     # Evaluate residuals
+#     problem.set_vars(train_x)
+#     train_y = problem.res # tensor with shape num_train x ntasks
 
-    model_list = ()
-    for task in range(0,ntasks):
-        train_y_task = train_y[:,task]
-        model = SingleTaskGP(train_x, train_y_task.reshape(-1,1),
-                             input_transform = Normalize(d=dim, bounds=bounds, indices=list(range(0,dim))),
-                             outcome_transform = Standardize(m=1))
-        model_list = model_list + (model,)
+#     model_list = ()
+#     for task in range(0,ntasks):
+#         train_y_task = train_y[:,task]
+#         model = SingleTaskGP(train_x, train_y_task.reshape(-1,1),
+#                              input_transform = Normalize(d=dim, bounds=bounds, indices=list(range(0,dim))),
+#                              outcome_transform = Standardize(m=1))
+#         model_list = model_list + (model,)
 
-    mt_model = ModelListGP(*model_list)
+#     mt_model = ModelListGP(*model_list)
     
-    mt_mll = SumMarginalLogLikelihood(mt_model.likelihood, mt_model)
-    fit_gpytorch_mll(mt_mll)
+#     mt_mll = SumMarginalLogLikelihood(mt_model.likelihood, mt_model)
+#     fit_gpytorch_mll(mt_mll)
 
-    hyperparams = mt_model.state_dict()
-    torch.save(hyperparams, 'hyperparams.pt')
+#     hyperparams = mt_model.state_dict()
+#     torch.save(hyperparams, 'hyperparams.pt')
 
-    # result = TrainedGP(problem, mt_model, train_x_mt, train_y)
-    result = {
-        "problem" : problem,
-        "model" : mt_model,
-        "train_x" : train_x_mt,
-        "train_y" : train_y
-    }    
-    return result
+#     # result = TrainedGP(problem, mt_model, train_x_mt, train_y)
+#     result = {
+#         "problem" : problem,
+#         "model" : mt_model,
+#         "train_x" : train_x_mt,
+#         "train_y" : train_y
+#     }    
+#     return result
