@@ -112,12 +112,15 @@ def active_learning_loop(trained_gp, acq_method, maxiters=20, disp=True, save_hi
         dist_history = []
         intersection_history = torch.empty(0,dim)
 
-    
-        # Run OpenMDAO problem from test function
-        for input_vec in input_list:
-            if truth_from == 'openmdao':
+        if truth_from == 'openmdao':
+            # Run OpenMDAO problem from test function
+            for input_vec in input_list:
                 assert(input_vec.size(0)==input_dim)
                 truth_list = torch.vstack((truth_list, problem.from_OpenMDAO(input_vec)))
+        elif truth_from == 'specify':
+            truth_list = save_hist[3]
+        else:
+            raise ValueError("Provide truth method.")
 
         intersection_history = update_history_list(dist_history, intersection_history, trained_gp, input_list, truth_list)
 
