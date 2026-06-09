@@ -14,6 +14,7 @@ from pathlib import Path
 import torch
 
 from .config import as_tensor, tensor, to_numpy, zeros
+from .openmdao_loader import load_openmdao_symbol
 
 
 class MDA(ABC):
@@ -137,8 +138,7 @@ class Satellite(MDA):
         import numpy as np
         import openmdao.api as om
 
-        from .satellite_openmdao import satelliteGroup
-
+        satelliteGroup = load_openmdao_symbol("satellite_openmdao.py", "satelliteGroup")
         prob = om.Problem()
         prob.model = satelliteGroup()
         prob.model.linear_solver = om.LinearBlockGS()
@@ -314,8 +314,7 @@ class Aerostructures(MDA):
 
         import openmdao.api as om
 
-        from .aerostructures_openmdao import aerostructuresGroup
-
+        aerostructuresGroup = load_openmdao_symbol("aerostructures_openmdao.py", "aerostructuresGroup")
         prob = om.Problem()
         prob.model = aerostructuresGroup()
         prob.driver = om.ScipyOptimizeDriver()
@@ -480,8 +479,8 @@ class Turbine(MDA):
 
         import openmdao.api as om
 
-        from .turbine_openmdao import turbineGroup, turbineGroup_feedback
-
+        turbineGroup = load_openmdao_symbol("turbine_openmdao.py", "turbineGroup")
+        turbineGroup_feedback = load_openmdao_symbol("turbine_openmdao.py", "turbineGroup_feedback")
         group = turbineGroup_feedback() if self.group_type == "feedback" else turbineGroup()
         prob = om.Problem(group)
         prob.setup()

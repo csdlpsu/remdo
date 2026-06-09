@@ -3,6 +3,8 @@ import openmdao.api as om
 import os
 from pathlib import Path
 
+import remdo
+
 os.environ['OPENMDAO_REPORTS'] = 'none'
 os.environ['OPENMDAO_USE_MPI'] = 'false'
 
@@ -20,11 +22,12 @@ class turbineHeatTransfer(om.ExplicitComponent):
         self.add_output('Tbulk', val=1000.)
 
         # MATLAB FEM setup
-        from . import turbineFEM
+        from remdo import turbineFEM
         import matlab
         self._double = matlab.double
         self._solveFEM = turbineFEM.initialize()
-        self._geometry_filename = str(Path(__file__).with_name("turbine_blade.STL"))
+        package_dir = Path(remdo.__file__).resolve().parent
+        self._geometry_filename = str(package_dir / "turbine_blade.STL")
 
     def setup_partials(self):
         """Declare complex-step finite-difference partial derivatives."""

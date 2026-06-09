@@ -21,7 +21,8 @@ python -m pip install -e .
 
 # Repository layout
 - `src/remdo/`: reusable REMDO package code.
-- `examples/`: example scripts and notebooks.
+- `openmdao/`: user-editable OpenMDAO model definitions for coupled systems.
+- `examples/`: example scripts.
 - `tests/`: test suite location.
 
 # Runtime configuration
@@ -43,6 +44,10 @@ mpiexec -n 4 python examples/satellite_active_learning.py --reps 20
 ```
 
 Each repetition uses a distinct randomized initial GP design seed.
+
+To add a new coupled-system example, first place the OpenMDAO model definition
+in `openmdao/`, then build the REMDO surrogate-modeling or active-learning
+workflow around that model from `src/remdo/` and `examples/`.
 
 # Turbine FEM requirements
 Running the turbine test function example requires [MATLAB Runtime R2024b](https://www.mathworks.com/products/compiler/matlab-runtime.html) to be installed and added to the system path.
