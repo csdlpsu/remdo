@@ -6,7 +6,11 @@ os.environ['OPENMDAO_REPORTS'] = 'none'
 os.environ['OPENMDAO_USE_MPI'] = 'false'
 
 class satelliteDis1(om.ExplicitComponent):
+    """First satellite discipline mapping ``(x, u21)`` to ``u12``."""
+
     def setup(self):
+        """Declare discipline inputs and coupling output."""
+
         # Global Design Variable
         self.add_input('x', val=np.ones(5))
         
@@ -17,10 +21,14 @@ class satelliteDis1(om.ExplicitComponent):
         self.add_output('u12', val=9.)
 
     def setup_partials(self):
+        """Declare complex-step finite-difference partial derivatives."""
+
         # Finite difference all partials
         self.declare_partials('*', '*', method='cs')
 
     def compute(self, inputs, outputs):
+        """Evaluate the first satellite discipline equation."""
+
         x1 = inputs['x'][0]
         x2 = inputs['x'][1]
         x3 = inputs['x'][2]
@@ -32,7 +40,11 @@ class satelliteDis1(om.ExplicitComponent):
         outputs['u12'] = x1**2 + 2*x2 - x3 + 2*(u21**0.5)
 
 class satelliteDis2(om.ExplicitComponent):
+    """Second satellite discipline mapping ``(x, u12)`` to ``u21``."""
+
     def setup(self):
+        """Declare discipline inputs and coupling output."""
+
         # Global Design Variable
         self.add_input('x', val=np.ones(5))
         
@@ -43,10 +55,14 @@ class satelliteDis2(om.ExplicitComponent):
         self.add_output('u21', val=9.)
         
     def setup_partials(self):
+        """Declare complex-step finite-difference partial derivatives."""
+
         # Finite difference all partials
         self.declare_partials('*', '*', method='cs')
 
     def compute(self, inputs, outputs):
+        """Evaluate the second satellite discipline equation."""
+
         x1 = inputs['x'][0]
         x4 = inputs['x'][3]
         x5 = inputs['x'][4]
@@ -56,7 +72,11 @@ class satelliteDis2(om.ExplicitComponent):
         
 
 class satelliteGroup(om.Group):
+    """OpenMDAO group for the coupled two-discipline satellite benchmark."""
+
     def setup(self):
+        """Assemble disciplines, nonlinear solver, and objective component."""
+
         cycle = self.add_subsystem('cycle', om.Group(), promotes=['*'])
         cycle.add_subsystem('d1', satelliteDis1(), promotes_inputs=['x', 'u21'], 
                            promotes_outputs=['u12'])

@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "remdo"
+version = "0.1.0"
+description = "Residual-enhanced surrogate modeling for coupled multidisciplinary systems."
+readme = "README.md"
+requires-python = ">=3.10"
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+remdo = ["turbine_blade.STL", "turbineFEM/*.ctf"]

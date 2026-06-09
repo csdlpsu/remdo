@@ -6,7 +6,11 @@ os.environ['OPENMDAO_REPORTS'] = 'none'
 os.environ['OPENMDAO_USE_MPI'] = 'false'
 
 class aerodynamicsDis(om.ExplicitComponent):
+    """Aerodynamics discipline mapping beam parameter and twist to lift."""
+
     def setup(self):
+        """Declare aerodynamics inputs and lift output."""
+
         # Global Design Variable
         self.add_input('B', val=0.)
 
@@ -17,10 +21,14 @@ class aerodynamicsDis(om.ExplicitComponent):
         self.add_output('L', val=0.)
 
     def setup_partials(self):
+        """Declare complex-step finite-difference partial derivatives."""
+
         # Finite difference all partials
         self.declare_partials('*', '*', method='cs')
 
     def compute(self, inputs, outputs):
+        """Evaluate the aerodynamic lift equation."""
+
         q = 1 # N/cm2
         C = 10 # cm
         psi = 0.05 # rad
@@ -33,7 +41,11 @@ class aerodynamicsDis(om.ExplicitComponent):
         outputs['L'] = 1/1000 * q*B*C * ((2*np.pi*(phi+psi)) + r*(1-np.cos(np.pi/2*(phi+psi)/theta0)))
 
 class structuresDis(om.ExplicitComponent):
+    """Structural discipline mapping lift to twist angle."""
+
     def setup(self):
+        """Declare structural input and twist output."""
+
         # Coupling parameter
         self.add_input('L', val=0.)
 
@@ -41,10 +53,14 @@ class structuresDis(om.ExplicitComponent):
         self.add_output('phi', val=0.)
 
     def setup_partials(self):
+        """Declare complex-step finite-difference partial derivatives."""
+
         # Finite difference all partials
         self.declare_partials('*', '*', method='cs')
 
     def compute(self, inputs, outputs):
+        """Evaluate the structural deflection equation."""
+
         C = 10 # cm
         p = 0.1111
         k1 = 4000 # N/cm
@@ -57,7 +73,11 @@ class structuresDis(om.ExplicitComponent):
         outputs['phi'] = np.remainder(( 1000*L/(k1*(1+p)) - (1000*L*p)/(k2*(1+p)) ) * ( 1/(C*(z2-z1)) ), 2*np.pi)
         
 class aerostructuresGroup(om.Group):
+    """OpenMDAO group for the coupled aerostructures benchmark."""
+
     def setup(self):
+        """Assemble aerodynamic and structural disciplines with a block solver."""
+
         cycle = self.add_subsystem('cycle', om.Group(), promotes=['*'])
         cycle.add_subsystem('aero', aerodynamicsDis(), promotes_inputs=['B', 'phi'],
                             promotes_outputs=['L'])
