@@ -34,8 +34,34 @@ import copy
 import inspect
 import pprint
 import importlib.util
+import json
+import select
+import subprocess
+import threading
+import atexit
+import time
+import contextlib
+import sys
 
 mcp = FastMCP("openmdao_mcp_server")
+
+
+@contextlib.contextmanager
+def _quiet_stdout():
+    """Redirect this process's stdout (fd 1) to stderr for the duration. The
+    MCP protocol owns stdout, but solvers/optimizers (e.g. SciPy's SLSQP) and
+    other libraries write progress text straight to fd 1 from compiled code,
+    which would corrupt the JSON-RPC stream. Sending it to stderr keeps the
+    channel clean while preserving the messages as logs."""
+    sys.stdout.flush()
+    saved = os.dup(1)
+    try:
+        os.dup2(2, 1)
+        yield
+    finally:
+        sys.stdout.flush()
+        os.dup2(saved, 1)
+        os.close(saved)
 
 # ---------------------------------------------------------------------------
 # Module-level state: the Problem plus the recorded specs that _build() turns
@@ -281,6 +307,99 @@ def _import_script(path):
     return module
 
 
+class _ExternalRuntimes:
+    """Runs external solve() scripts in helper processes — one reusable helper per
+    named runtime, so a slow helper startup is paid once and several runtimes can
+    coexist. A component's runtime= label (from add_script_component) selects the
+    helper, so e.g. a live MATLAB engine and a compiled-MATLAB mwpython helper run
+    side by side. Script-agnostic: each request carries the script path, entry
+    point, inputs, and a config dict, so one helper runs any analysis.
+
+    Each runtime is configured entirely by environment variables (no machine
+    paths baked in). For a runtime label NAME (upper-cased, non-alphanumerics ->
+    '_'; runtime="matlab" -> MATLAB):
+      REMDO_RT_<NAME>_LAUNCHER  interpreter that can load that runtime. Required.
+      REMDO_RT_<NAME>_RUNNER    generic worker script it executes. Required.
+      REMDO_RT_<NAME>_ARGS      optional extra launcher args, space-split.
+      REMDO_RT_<NAME>_ENV       optional 'K=V;K=V' env additions for the helper.
+    """
+
+    def __init__(self):
+        self._procs = {}  # runtime label -> Popen
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _key(runtime):
+        return "".join(c if c.isalnum() else "_" for c in runtime).upper()
+
+    def _start(self, runtime):
+        key = self._key(runtime)
+        launcher = os.environ.get(f"REMDO_RT_{key}_LAUNCHER")
+        runner = os.environ.get(f"REMDO_RT_{key}_RUNNER")
+        missing = [n for n, v in ((f"REMDO_RT_{key}_LAUNCHER", launcher),
+                                  (f"REMDO_RT_{key}_RUNNER", runner)) if not v]
+        if missing:
+            raise RuntimeError(
+                f"Script component runtime '{runtime}' is not configured. Set "
+                "environment variable(s): " + ", ".join(missing) + ".")
+        extra = os.environ.get(f"REMDO_RT_{key}_ARGS", "").split()
+        env = dict(os.environ)
+        for pair in os.environ.get(f"REMDO_RT_{key}_ENV", "").split(";"):
+            if "=" in pair:
+                k, v = pair.split("=", 1)
+                env[k.strip()] = v
+        proc = subprocess.Popen(
+            [launcher, runner, *extra],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True, bufsize=1, env=env)
+        self._procs[runtime] = proc
+        atexit.register(self.shutdown)
+        return proc
+
+    def call(self, runtime, script_path, function, inputs, config, timeout=300):
+        with self._lock:
+            proc = self._procs.get(runtime)
+            if proc is None or proc.poll() is not None:
+                proc = self._start(runtime)
+            request = {"script": script_path, "function": function,
+                       "inputs": inputs, "config": config}
+            proc.stdin.write(json.dumps(request) + "\n")
+            proc.stdin.flush()
+            deadline = time.time() + timeout
+            while True:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    raise TimeoutError(f"Runtime '{runtime}' helper did not respond in time.")
+                ready, _, _ = select.select([proc.stdout], [], [], remaining)
+                if not ready:
+                    continue
+                line = proc.stdout.readline()
+                if line == "":
+                    raise RuntimeError(f"Runtime '{runtime}' helper exited unexpectedly.")
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    message = json.loads(line)
+                except json.JSONDecodeError:
+                    continue  # stray runtime output on stdout — ignore
+                if "error" in message:
+                    raise RuntimeError(f"Runtime '{runtime}' helper error: {message['error']}")
+                return message["result"]
+
+    def shutdown(self):
+        for proc in self._procs.values():
+            if proc.poll() is None:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+        self._procs = {}
+
+
+_external_runtimes = _ExternalRuntimes()
+
+
 class ScriptComp(om.ExplicitComponent):
     """A scalar ExplicitComponent that delegates compute to a function in an
     external Python script (a CFD/FEM solver, a legacy analysis, ...). The spec
@@ -323,8 +442,20 @@ class ScriptComp(om.ExplicitComponent):
 
     def compute(self, inputs, outputs):
         spec = self.options["spec"]
-        fn = self._load()
-        result = fn({name: float(inputs[name][0]) for name in spec["inputs"]})
+        in_vals = {name: float(inputs[name][0]) for name in spec["inputs"]}
+        runtime = spec.get("runtime", "inprocess")
+        if runtime != "inprocess":
+            # Script can't run in this process (e.g. compiled MATLAB on macOS):
+            # delegate to the shared helper for this runtime. The config carries
+            # the component's input/output names plus anything the user passed, so
+            # a generic adapter can run any analysis without per-script Python.
+            config = dict(spec.get("config") or {})
+            config.setdefault("inputs", list(spec["inputs"]))
+            config.setdefault("outputs", list(spec["outputs"]))
+            result = _external_runtimes.call(
+                runtime, spec["script_path"], spec["function"], in_vals, config)
+        else:
+            result = self._load()(in_vals)
         if not isinstance(result, dict):
             raise TypeError(
                 f"'{spec['function']}' in '{spec['script_path']}' must return a dict "
@@ -507,6 +638,9 @@ def _generate_script():
     disc_group = _disc_to_group()
     has_component = any(d.get("kind") == "component" for d in disciplines)
     has_script = any(d.get("kind") == "script" for d in disciplines)
+    has_bridge = any(d.get("kind") == "script"
+                     and d.get("runtime", "inprocess") != "inprocess"
+                     for d in disciplines)
     optimize = objective is not None and bool(design_vars)
     opt = (prob.driver.options["optimizer"]
            if isinstance(prob.driver, om.ScipyOptimizeDriver) else "SLSQP")
@@ -518,6 +652,9 @@ def _generate_script():
          '"""']
     if has_script:
         L += ["import os", "import importlib.util"]
+        if has_bridge:
+            L += ["import json", "import select", "import subprocess",
+                  "import threading", "import atexit", "import time"]
     L += ["import numpy as np", "import openmdao.api as om", ""]
 
     # ExpressionComp + its math namespace, only when a full component is used.
@@ -539,7 +676,11 @@ def _generate_script():
     if has_script:
         L.append("_script_modules = {}  # abspath -> (mtime, module)")
         L.append(inspect.getsource(_import_script).rstrip())
-        L += ["", inspect.getsource(ScriptComp).rstrip(), "", ""]
+        L += [""]
+        if has_bridge:
+            L += [inspect.getsource(_ExternalRuntimes).rstrip(), "",
+                  "_external_runtimes = _ExternalRuntimes()", ""]
+        L += [inspect.getsource(ScriptComp).rstrip(), "", ""]
 
     L += ["prob = om.Problem(reports=False)", "prob.model = om.Group()", ""]
 
@@ -786,7 +927,7 @@ async def define_problem(spec: dict):
         for item in spec.get("script_components", []):
             await add_script_component(**_fields(
                 item, {"name", "script_path", "function", "inputs", "outputs",
-                       "derivatives"}, "script_components[]"))
+                       "derivatives", "runtime", "config"}, "script_components[]"))
 
         # 3. Groups, then solvers (create_group checks disciplines exist; the
         #    solver checks its group exists).
@@ -1021,6 +1162,8 @@ async def add_script_component(
     outputs: list[str],
     function: str = "solve",
     derivatives: str = "fd",
+    runtime: str = "inprocess",
+    config: dict = None,
 ):
     """
     Record a discipline that wraps an EXTERNAL Python script as a black box — use
@@ -1055,6 +1198,21 @@ async def add_script_component(
     derivatives: how OpenMDAO differentiates this black box — "fd" (finite
                  difference, default; always safe) or "cs" (complex step; only
                  if the script is fully complex-safe).
+    runtime:     where the script executes. "inprocess" (default) imports and
+                 runs it in this server — correct for ordinary Python scripts.
+                 Any other label (e.g. "matlab") runs it in a shared external
+                 helper for that runtime, for scripts this process can't load
+                 directly (compiled MATLAB on macOS, a live MATLAB engine, a
+                 different Python, ...). Each runtime's helper is configured via
+                 REMDO_RT_<NAME>_* environment variables, so several coexist and
+                 the label picks one. The same helper serves every component of
+                 that runtime, so its slow startup is paid only once.
+    config:      optional dict passed to the script (as a second argument, if it
+                 accepts one). Lets a single GENERIC adapter run many analyses
+                 without a per-analysis Python file — e.g. a MATLAB-engine adapter
+                 reads config={"matlab_function": "mystery", "addpath": "/dir"} to
+                 know which .m to call. The component's input/output names are
+                 added to config automatically.
 
     This runs arbitrary Python in the server process by design — the expression
     sandbox that protects add_component does NOT apply here, so only point it at
@@ -1067,6 +1225,10 @@ async def add_script_component(
         raise ValueError("derivatives must be 'fd' or 'cs'.")
     if not function.isidentifier():
         raise ValueError(f"function name '{function}' is not a valid identifier.")
+    if not isinstance(runtime, str) or not runtime:
+        raise ValueError("runtime must be a non-empty string (e.g. 'inprocess' or 'matlab').")
+    if config is not None and not isinstance(config, dict):
+        raise ValueError("config must be a dict or null.")
     if any(d["name"] == name for d in disciplines):
         raise ValueError(f"A discipline named '{name}' already exists.")
     if not inputs:
@@ -1092,31 +1254,39 @@ async def add_script_component(
             raise ValueError(f"Duplicate output name '{ov}'.")
         out_seen.add(ov)
 
-    # Validate the script now: import it (runs its top level once, then cached),
-    # confirm the entry point exists, is callable, and takes a positional arg.
     resolved = os.path.abspath(os.path.expanduser(script_path))
-    try:
-        module = _import_script(resolved)
-    except Exception as exc:
-        raise ValueError(f"Could not import '{script_path}': {exc}")
-    fn = getattr(module, function, None)
-    if fn is None:
-        raise ValueError(f"Script '{resolved}' has no function '{function}'.")
-    if not callable(fn):
-        raise ValueError(f"'{function}' in '{resolved}' is not callable.")
-    sig = None
-    try:
-        sig = inspect.signature(fn)
-    except (ValueError, TypeError):
-        pass  # some callables hide their signature; skip the arity check
-    if sig is not None:
-        positional = [p for p in sig.parameters.values()
-                      if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD,
-                                    p.VAR_POSITIONAL)]
-        if not positional:
-            raise ValueError(
-                f"'{function}' takes no positional argument; it must accept a "
-                f"single dict of inputs, e.g. def {function}(inputs): ...")
+    if runtime == "inprocess":
+        # Validate the script now: import it (runs its top level once, then
+        # cached), confirm the entry point exists, is callable, takes a positional
+        # arg.
+        try:
+            module = _import_script(resolved)
+        except Exception as exc:
+            raise ValueError(f"Could not import '{script_path}': {exc}")
+        fn = getattr(module, function, None)
+        if fn is None:
+            raise ValueError(f"Script '{resolved}' has no function '{function}'.")
+        if not callable(fn):
+            raise ValueError(f"'{function}' in '{resolved}' is not callable.")
+        sig = None
+        try:
+            sig = inspect.signature(fn)
+        except (ValueError, TypeError):
+            pass  # some callables hide their signature; skip the arity check
+        if sig is not None:
+            positional = [p for p in sig.parameters.values()
+                          if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD,
+                                        p.VAR_POSITIONAL)]
+            if not positional:
+                raise ValueError(
+                    f"'{function}' takes no positional argument; it must accept a "
+                    f"single dict of inputs, e.g. def {function}(inputs): ...")
+    else:
+        # External runtime: the script cannot be imported in this process (that's
+        # the whole point), so just confirm the file exists. The entry point is
+        # checked by the helper on first evaluation.
+        if not os.path.isfile(resolved):
+            raise ValueError(f"Script not found: {resolved}")
 
     disciplines.append({
         "name": name,
@@ -1126,9 +1296,13 @@ async def add_script_component(
         "inputs": list(inputs),
         "outputs": list(outputs),
         "derivatives": derivatives,
+        "runtime": runtime,
+        "config": dict(config) if config else {},
     })
+    where = ("in this server" if runtime == "inprocess"
+             else f"via the '{runtime}' external helper")
     return (f"Script component '{name}' recorded: {len(inputs)} input(s), "
-            f"{len(outputs)} output(s), partials via {derivatives}. "
+            f"{len(outputs)} output(s), partials via {derivatives}, runs {where}. "
             f"Wraps {function}() in {resolved}. Seed inputs with set_initial_value, "
             f"then run().")
 
@@ -1534,8 +1708,9 @@ async def run():
         prob.driver = om.ScipyOptimizeDriver()
         prob.driver.options["optimizer"] = "SLSQP"
 
-    _build()
-    failed = prob.run_driver()
+    with _quiet_stdout():
+        _build()
+        failed = prob.run_driver()
 
     def fmt(path):
         val = np.asarray(prob.get_val(path)).flatten()
