@@ -49,12 +49,25 @@ REMDO_RT_MATLAB_COMPILED_ENV      = PYTHONHOME=<env>;DYLD_LIBRARY_PATH=<env>/lib
 ### A live `.m` function — zero Python
 
 Point the component at the generic adapter and name the MATLAB function via
-`config`. `mystery.m` is an example function:
+`config`.
+
+**Easiest — `add_matlab_component`** (preferred). With `REMDO_RT_MATLAB_ADAPTER`
+set to `matlab_engine_runner.py`, one call wires a `.m`; its signature is parsed,
+so inputs/outputs/function are inferred:
+
+```python
+add_matlab_component(name="m", mfile_path="<repo>/examples/matlab/mystery.m")
+```
+
+For a `.m` only attached in the conversation (not on this machine), call
+`stage_file(filename, content)` first and pass the returned path as `mfile_path`.
+
+**Manual equivalent** (what `add_matlab_component` does under the hood):
 
 ```python
 add_script_component(
     name="m", script_path="<repo>/matlab_engine_runner.py",
-    inputs=["x", "y"], outputs=["f"], runtime="matlab",
+    inputs=["x", "y"], outputs=["f"], runtime="matlab", call_style="positional",
     config={"matlab_function": "mystery", "addpath": "<repo>/examples/matlab"})
 ```
 

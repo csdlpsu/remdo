@@ -42,8 +42,13 @@ import atexit
 import time
 import contextlib
 import sys
+import re
 
 mcp = FastMCP("openmdao_mcp_server")
+
+# Directory where stage_file() places scripts the agent receives in chat (when
+# the user's file lives only in the conversation, not on this machine).
+_STAGED_DIR = os.path.join(os.path.expanduser("~"), ".openmdao_mcp", "staged")
 
 
 @contextlib.contextmanager
@@ -307,6 +312,42 @@ def _import_script(path):
     return module
 
 
+_MATLAB_FUNC_RE = re.compile(
+    r"^\s*function\s+"
+    r"(?:(?P<outs>\[[^\]]*\]|[A-Za-z_]\w*)\s*=\s*)?"
+    r"(?P<name>[A-Za-z_]\w*)\s*"
+    r"(?:\(\s*(?P<args>[^)]*)\))?\s*$")
+
+
+def _parse_matlab_signature(text):
+    """Parse the first MATLAB function declaration in `text`, returning
+    (function_name, [inputs], [outputs]). Handles:
+        function out = name(a, b)        -> ("name", ["a","b"], ["out"])
+        function [o1, o2] = name(a, b)   -> ("name", ["a","b"], ["o1","o2"])
+        function name(a)                 -> ("name", ["a"], [])  (no outputs)
+    Raises ValueError when no declaration is present or it can't be parsed."""
+    decl = None
+    for line in text.splitlines():
+        if line.strip().startswith("function"):
+            decl = line
+            break
+    if decl is None:
+        raise ValueError(
+            "No 'function' declaration found in the .m file; pass inputs, outputs, "
+            "and matlab_function explicitly.")
+    m = _MATLAB_FUNC_RE.match(decl)
+    if not m:
+        raise ValueError(
+            f"Could not parse the MATLAB function declaration {decl.strip()!r}; "
+            "pass inputs, outputs, and matlab_function explicitly.")
+    outs_raw = (m.group("outs") or "").strip()
+    if outs_raw.startswith("["):
+        outs_raw = outs_raw[1:-1]
+    outputs = [o.strip() for o in outs_raw.split(",") if o.strip()]
+    inputs = [a.strip() for a in (m.group("args") or "").split(",") if a.strip()]
+    return m.group("name"), inputs, outputs
+
+
 class _ExternalRuntimes:
     """Runs external solve() scripts in helper processes — one reusable helper per
     named runtime, so a slow helper startup is paid once and several runtimes can
@@ -348,10 +389,14 @@ class _ExternalRuntimes:
             if "=" in pair:
                 k, v = pair.split("=", 1)
                 env[k.strip()] = v
+        # Inherit stderr (stderr=None) so a helper's tracebacks/diagnostics reach
+        # this server's stderr/logs instead of vanishing — only stdout carries the
+        # JSON protocol, so helper stderr is safe to surface and invaluable when a
+        # helper fails to start.
         proc = subprocess.Popen(
             [launcher, runner, *extra],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, text=True, bufsize=1, env=env)
+            stderr=None, text=True, bufsize=1, env=env)
         self._procs[runtime] = proc
         atexit.register(self.shutdown)
         return proc
@@ -404,8 +449,10 @@ class ScriptComp(om.ExplicitComponent):
     """A scalar ExplicitComponent that delegates compute to a function in an
     external Python script (a CFD/FEM solver, a legacy analysis, ...). The spec
     records the script path, entry-point function name, and the input/output
-    names. On compute the function is called with {input_name: float} and must
-    return {output_name: float}. Partials are finite-differenced (or complex-
+    names, and the call_style. On compute the function is called either with one
+    dict {input_name: float} (call_style 'dict', returning {output_name: float})
+    or with positional scalars in declared order (call_style 'positional',
+    returning a scalar/tuple/dict). Partials are finite-differenced (or complex-
     stepped) by OpenMDAO — a black box has no closed form — so every
     (output, input) pair is declared 'fd'/'cs'. The spec is the same discipline
     dict add_script_component records; _build passes it in as 'spec'."""
@@ -440,32 +487,58 @@ class ScriptComp(om.ExplicitComponent):
         self._fn = fn
         return fn
 
+    @staticmethod
+    def _to_output_dict(raw, spec):
+        """Map a script's return value onto declared outputs. A dict is keyed by
+        output name (any call_style). For call_style='positional': a tuple/list
+        zips with declared outputs (lengths must match); a bare scalar fills the
+        single declared output (error if more than one is declared)."""
+        out_names = spec["outputs"]
+        where = f"'{spec['function']}' in '{spec['script_path']}'"
+        if isinstance(raw, dict):
+            missing = [o for o in out_names if o not in raw]
+            if missing:
+                raise KeyError(f"{where} did not return output(s) {missing}. "
+                               f"Returned keys: {sorted(raw)}.")
+            return {o: float(raw[o]) for o in out_names}
+        if spec.get("call_style", "dict") == "positional":
+            if isinstance(raw, (tuple, list)):
+                if len(raw) != len(out_names):
+                    raise ValueError(f"{where} returned {len(raw)} value(s) but "
+                                     f"{len(out_names)} output(s) are declared.")
+                return {o: float(v) for o, v in zip(out_names, raw)}
+            if len(out_names) != 1:
+                raise ValueError(f"{where} returned a single value but "
+                                 f"{len(out_names)} outputs are declared — return a "
+                                 "tuple/list or a dict.")
+            return {out_names[0]: float(raw)}
+        raise TypeError(f"{where} must return a dict of {{output_name: value}}, "
+                        f"got {type(raw).__name__}.")
+
     def compute(self, inputs, outputs):
         spec = self.options["spec"]
         in_vals = {name: float(inputs[name][0]) for name in spec["inputs"]}
+        call_style = spec.get("call_style", "dict")
         runtime = spec.get("runtime", "inprocess")
         if runtime != "inprocess":
             # Script can't run in this process (e.g. compiled MATLAB on macOS):
             # delegate to the shared helper for this runtime. The config carries
-            # the component's input/output names plus anything the user passed, so
-            # a generic adapter can run any analysis without per-script Python.
+            # the component's input/output names and call_style plus anything the
+            # user passed, so a generic adapter can run any analysis without
+            # per-script Python.
             config = dict(spec.get("config") or {})
             config.setdefault("inputs", list(spec["inputs"]))
             config.setdefault("outputs", list(spec["outputs"]))
-            result = _external_runtimes.call(
+            config.setdefault("call_style", call_style)
+            raw = _external_runtimes.call(
                 runtime, spec["script_path"], spec["function"], in_vals, config)
+        elif call_style == "positional":
+            raw = self._load()(*(in_vals[name] for name in spec["inputs"]))
         else:
-            result = self._load()(in_vals)
-        if not isinstance(result, dict):
-            raise TypeError(
-                f"'{spec['function']}' in '{spec['script_path']}' must return a dict "
-                f"of {{output_name: value}}, got {type(result).__name__}.")
+            raw = self._load()(in_vals)
+        mapped = self._to_output_dict(raw, spec)
         for oname in spec["outputs"]:
-            if oname not in result:
-                raise KeyError(
-                    f"'{spec['function']}' did not return output '{oname}'. "
-                    f"Returned keys: {sorted(result)}.")
-            outputs[oname] = float(result[oname])
+            outputs[oname] = mapped[oname]
 
 
 def _dataflow_disc_edges():
@@ -582,16 +655,16 @@ def _build():
         prob.model.add_constraint(_full_name(c["name"]),
                                   lower=c["lower"], upper=c["upper"], equals=c["equals"])
 
-        # Execution order: OpenMDAO runs subsystems in add order, so a consumer
-        # added before its producer (as define_problem's category ordering can do)
-        # severs the total-derivative chain and the optimizer sees a zero gradient.
-        # Set a topological order from the data-flow DAG so add order stops mattering.
-        top_order, group_order = _exec_orders(disc_group)
-        if top_order is not None:
-            prob.model.set_order(top_order)
-        for g, order in group_order.items():
-            group_objs[g].set_order(order)
-
+    # Execution order: OpenMDAO runs subsystems in add order, so a consumer
+    # added before its producer (as define_problem's category ordering can do)
+    # severs the total-derivative chain and the optimizer sees a zero gradient.
+    # Set a topological order from the data-flow DAG so add order stops mattering.
+    # Runs exactly once, after every discipline and constraint is recorded.
+    top_order, group_order = _exec_orders(disc_group)
+    if top_order is not None:
+        prob.model.set_order(top_order)
+    for g, order in group_order.items():
+        group_objs[g].set_order(order)
 
     # Iterative solvers, scoped to their group.
     for g, s in group_solvers.items():
@@ -837,6 +910,51 @@ async def create_problem():
 
 
 @mcp.tool()
+async def stage_file(filename: str, content: str) -> str:
+    """
+    Write a script the user provided IN THE CONVERSATION onto this machine so it
+    can be wired as a component. When the user attaches or pastes a script
+    (.py or .m), call this with the exact content to place it on the user's
+    machine, then wire it as a component — the agent can read attached content but
+    cannot otherwise write here, and add_script_component needs a local path.
+
+    Only stage content the user explicitly provided — never stage code the user
+    hasn't seen. This tool lets the agent author executable code onto the machine,
+    a wider trust surface than pointing at files that already exist there.
+
+    filename: a file name; any directory parts are stripped and it must have an
+              extension (e.g. 'analysis.py', 'rosenbrock.m').
+    content:  the exact file content to write (~2 MB maximum).
+
+    Re-staging the same name OVERWRITES the prior file, which is intended: the
+    build's mtime cache picks up the change, so re-staging an edited script just
+    works. Returns the absolute staged path and the next step keyed by extension:
+    .py -> add_script_component with that path (inprocess); .m -> add_matlab_component.
+    """
+    base = os.path.basename(filename.strip())
+    if not base or base in (".", ".."):
+        raise ValueError("filename must be a real file name.")
+    if not os.path.splitext(base)[1]:
+        raise ValueError("filename must have an extension (e.g. '.py' or '.m').")
+    if len(content.encode("utf-8")) > 2 * 1024 * 1024:
+        raise ValueError("content exceeds the ~2 MB staging limit.")
+    os.makedirs(_STAGED_DIR, exist_ok=True)
+    path = os.path.join(_STAGED_DIR, base)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+    ext = os.path.splitext(base)[1].lower()
+    if ext == ".py":
+        nxt = ("Next: add_script_component(script_path=<this path>) — runs inprocess. "
+               "If the function is positional like def f(x, y), pass call_style='positional'.")
+    elif ext == ".m":
+        nxt = ("Next: add_matlab_component(mfile_path=<this path>) — the .m signature "
+               "is parsed for you.")
+    else:
+        nxt = "Next: wire it with add_script_component(script_path=<this path>)."
+    return f"Staged file at: {path}\n{nxt}"
+
+
+@mcp.tool()
 async def define_problem(spec: dict):
     """
     Define an ENTIRE optimization problem in one call from a single spec object,
@@ -847,8 +965,14 @@ async def define_problem(spec: dict):
     This CLEARS any current problem and loads the spec fresh (like calling
     create_problem first). It is atomic: if any part of the spec is invalid,
     nothing is changed — the previous state is restored and an error is returned.
+    (Exception: files written by "staged_files" before a later failure remain on
+    disk; that's harmless — re-running overwrites them.)
 
     spec is an object with these optional keys (each mirrors a granular tool):
+      "staged_files":  [ {"filename": "f.py", "content": "..."} ]   (attached files)
+      "script_components": [ {"name": "cfd", "script_path": "...", "inputs": [...],
+                          "outputs": [...], "call_style": "positional"} ]
+      "matlab_components": [ {"name": "rb", "mfile_path": "...md/rb.m"} ]
       "disciplines":   [ {"expression": "y = x**2 + 3", "name": "d1"} ]   (name optional)
       "components":    [ {"name": "c", "inputs": ["q"],
                           "outputs": {"f": "(q-10)**2"},
@@ -870,10 +994,10 @@ async def define_problem(spec: dict):
     """
     if not isinstance(spec, dict):
         raise ValueError("spec must be an object (JSON dict).")
-    allowed_keys = {"disciplines", "components", "script_components", "groups",
-                    "group_solvers", "connections", "promotions", "objective",
-                    "design_vars", "constraints", "initial_values",
-                    "approx_totals", "optimizer"}
+    allowed_keys = {"staged_files", "disciplines", "components", "script_components",
+                    "matlab_components", "groups", "group_solvers", "connections",
+                    "promotions", "objective", "design_vars", "constraints",
+                    "initial_values", "approx_totals", "optimizer"}
     extra = set(spec) - allowed_keys
     if extra:
         raise ValueError(f"Unknown spec key(s) {sorted(extra)}; "
@@ -910,6 +1034,12 @@ async def define_problem(spec: dict):
         approx_totals_cfg.clear(); approx_totals_cfg.update(snap["approx_totals_cfg"])
 
     try:
+        # 0. Stage any attached files first, so script/matlab components below can
+        #    reference their staged paths. Staging writes to disk and is NOT undone
+        #    by rollback — a staged file left behind on a later failure is harmless.
+        for item in spec.get("staged_files", []):
+            await stage_file(**_fields(item, {"filename", "content"}, "staged_files[]"))
+
         # 1. Fresh problem.
         prob = om.Problem(reports=False)
         for lst in (disciplines, connections, design_vars, constraints, promotions):
@@ -927,7 +1057,12 @@ async def define_problem(spec: dict):
         for item in spec.get("script_components", []):
             await add_script_component(**_fields(
                 item, {"name", "script_path", "function", "inputs", "outputs",
-                       "derivatives", "runtime", "config"}, "script_components[]"))
+                       "derivatives", "runtime", "config", "call_style"},
+                "script_components[]"))
+        for item in spec.get("matlab_components", []):
+            await add_matlab_component(**_fields(
+                item, {"name", "mfile_path", "inputs", "outputs", "matlab_function"},
+                "matlab_components[]"))
 
         # 3. Groups, then solvers (create_group checks disciplines exist; the
         #    solver checks its group exists).
@@ -1164,30 +1299,37 @@ async def add_script_component(
     derivatives: str = "fd",
     runtime: str = "inprocess",
     config: dict = None,
+    call_style: str = "dict",
 ):
     """
-    Record a discipline that wraps an EXTERNAL Python script as a black box — use
-    this for a CFD/FEM solver, a legacy analysis routine, or any computation you
-    already have in a .py file and don't want to re-express as algebra. The
-    script is run as-is; its derivatives are finite-differenced by OpenMDAO,
-    since a black box has no analytic form. All variables are scalars.
+    Record a discipline that wraps an EXTERNAL script as a black box — a CFD/FEM
+    solver, a legacy analysis, or any computation you already have in a file and
+    don't want to re-express as algebra. Derivatives are finite-differenced by
+    OpenMDAO, since a black box has no analytic form. All variables are scalars.
 
-    The script must define a function (default name 'solve') with this contract:
+    WHERE IS THE FILE? Decide this first:
+      - Already on THIS machine (a path the server can read): pass that path as
+        script_path.
+      - Only attached/pasted in the conversation (the agent can read its content
+        but it isn't on this machine): call stage_file(filename, content) FIRST to
+        place it here, then pass the returned staged path as script_path.
+      - A MATLAB .m file: prefer add_matlab_component — it parses the .m signature
+        and wires the MATLAB runtime for you (stage the .m first if it's attached).
 
-        def solve(inputs):                 # inputs == {"v": 50.0, "rho": 1.225, ...}
-            ...                            # run the analysis
-            return {"drag": 918.75, ...}   # one entry per declared output
-
-    i.e. it takes ONE dict of {input_name: float} and returns a dict of
-    {output_name: float}. The server calls it once per evaluation, feeding the
-    declared inputs in and reading the declared outputs out.
+    CALL STYLE — match how the script's function is actually written:
+      - call_style="dict" (default): def solve(inputs): return {"drag": 918.75}
+            inputs is {input_name: float}; returns {output_name: float}.
+      - call_style="positional": def rosenbrock(x, y): return (1-x)**2 + ...
+            called as fn(*inputs in declared order); returns a scalar (one output),
+            or a tuple/list (zipped with outputs), or a dict.
 
     name:        subsystem name. Refer to its variables elsewhere as
                  'name.variable' (e.g. 'cfd.drag') — never add a group prefix
                  yourself; the server adds it if you group this discipline.
-    script_path: path to the .py file. '~' and relative paths are resolved and
-                 the absolute path is stored. The file is imported and the
-                 function checked NOW, so a bad path or name fails immediately.
+    script_path: path to the script file (a staged path is fine). '~' and relative
+                 paths are resolved and the absolute path is stored. For inprocess
+                 runtime the file is imported and the function checked NOW, so a
+                 bad path or name fails immediately.
     inputs:      input variable names the function expects as dict keys, e.g.
                  ["v", "rho", "cd", "area"]. They default to 1.0; seed real
                  starting values with set_initial_value, or feed them via
@@ -1198,7 +1340,10 @@ async def add_script_component(
     derivatives: how OpenMDAO differentiates this black box — "fd" (finite
                  difference, default; always safe) or "cs" (complex step; only
                  if the script is fully complex-safe).
-    runtime:     where the script executes. "inprocess" (default) imports and
+    call_style:  "dict" (default) or "positional" — see CALL STYLE above. Most
+                 real-world files (e.g. def rosenbrock(x, y)) are "positional".
+    runtime:     where the script executes. For a MATLAB .m, use add_matlab_component
+                 instead of setting this by hand. "inprocess" (default) imports and
                  runs it in this server — correct for ordinary Python scripts.
                  Any other label (e.g. "matlab") runs it in a shared external
                  helper for that runtime, for scripts this process can't load
@@ -1229,6 +1374,8 @@ async def add_script_component(
         raise ValueError("runtime must be a non-empty string (e.g. 'inprocess' or 'matlab').")
     if config is not None and not isinstance(config, dict):
         raise ValueError("config must be a dict or null.")
+    if call_style not in ("dict", "positional"):
+        raise ValueError("call_style must be 'dict' or 'positional'.")
     if any(d["name"] == name for d in disciplines):
         raise ValueError(f"A discipline named '{name}' already exists.")
     if not inputs:
@@ -1257,10 +1404,12 @@ async def add_script_component(
     resolved = os.path.abspath(os.path.expanduser(script_path))
     if runtime == "inprocess":
         # Validate the script now: import it (runs its top level once, then
-        # cached), confirm the entry point exists, is callable, takes a positional
-        # arg.
+        # cached), confirm the entry point exists, is callable, and has an arity
+        # consistent with call_style. Import under _quiet_stdout so a staged
+        # script's top-level print() can't corrupt the JSON-RPC stream.
         try:
-            module = _import_script(resolved)
+            with _quiet_stdout():
+                module = _import_script(resolved)
         except Exception as exc:
             raise ValueError(f"Could not import '{script_path}': {exc}")
         fn = getattr(module, function, None)
@@ -1277,10 +1426,19 @@ async def add_script_component(
             positional = [p for p in sig.parameters.values()
                           if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD,
                                         p.VAR_POSITIONAL)]
-            if not positional:
+            has_varargs = any(p.kind == p.VAR_POSITIONAL for p in positional)
+            if call_style == "positional":
+                if not has_varargs and len(positional) != len(inputs):
+                    raise ValueError(
+                        f"'{function}' takes {len(positional)} positional argument(s) "
+                        f"but {len(inputs)} input(s) are declared; with "
+                        f"call_style='positional' they must match (def {function}"
+                        f"({', '.join(inputs)}): ...).")
+            elif not positional:
                 raise ValueError(
-                    f"'{function}' takes no positional argument; it must accept a "
-                    f"single dict of inputs, e.g. def {function}(inputs): ...")
+                    f"'{function}' takes no positional argument; with call_style="
+                    f"'dict' it must accept a single dict, e.g. def {function}"
+                    f"(inputs): ...")
     else:
         # External runtime: the script cannot be imported in this process (that's
         # the whole point), so just confirm the file exists. The entry point is
@@ -1298,6 +1456,7 @@ async def add_script_component(
         "derivatives": derivatives,
         "runtime": runtime,
         "config": dict(config) if config else {},
+        "call_style": call_style,
     })
     where = ("in this server" if runtime == "inprocess"
              else f"via the '{runtime}' external helper")
@@ -1305,6 +1464,66 @@ async def add_script_component(
             f"{len(outputs)} output(s), partials via {derivatives}, runs {where}. "
             f"Wraps {function}() in {resolved}. Seed inputs with set_initial_value, "
             f"then run().")
+
+
+@mcp.tool()
+async def add_matlab_component(name: str, mfile_path: str, inputs: list[str] = None,
+                               outputs: list[str] = None, matlab_function: str = None):
+    """
+    Wire a MATLAB .m function as a black-box component — the easy MATLAB route.
+    Neither you nor the user needs to know the engine-adapter path or the runtime
+    wiring; this resolves both and reads the .m signature for you, then delegates
+    to add_script_component with runtime='matlab'.
+
+    For a .m attached in the conversation, call stage_file FIRST, then pass the
+    staged path here. The signature is parsed from the first 'function' line, so
+    inputs/outputs/matlab_function are inferred automatically — pass them only to
+    override, or if the file's signature can't be parsed.
+
+    name:            subsystem name. Refer to its variables as 'name.variable'.
+    mfile_path:      path to the .m file (a staged path or any pre-existing path).
+    inputs:          input names; default = the .m function's argument names.
+    outputs:         output names; default = the .m function's return names.
+    matlab_function: MATLAB function to call; default = the name in the .m file.
+
+    Requires REMDO_RT_MATLAB_ADAPTER (the MATLAB-engine adapter script) and a
+    configured 'matlab' runtime (REMDO_RT_MATLAB_* env vars).
+    """
+    require_problem()
+    adapter = os.environ.get("REMDO_RT_MATLAB_ADAPTER")
+    if not adapter:
+        raise ValueError(
+            "REMDO_RT_MATLAB_ADAPTER is not set. Point it at the MATLAB-engine "
+            "adapter script (e.g. matlab_engine_runner.py) the server should use "
+            "to run .m files.")
+    resolved = os.path.abspath(os.path.expanduser(mfile_path))
+    if not os.path.isfile(resolved):
+        raise ValueError(f"MATLAB file not found: {resolved}")
+
+    if inputs is None or outputs is None or matlab_function is None:
+        with open(resolved, encoding="utf-8") as f:
+            parsed_name, parsed_inputs, parsed_outputs = _parse_matlab_signature(f.read())
+        if matlab_function is None:
+            matlab_function = parsed_name
+        if inputs is None:
+            inputs = parsed_inputs
+        if outputs is None:
+            outputs = parsed_outputs
+    if not outputs:
+        raise ValueError(
+            f"The MATLAB function '{matlab_function}' declares no outputs; a "
+            "component needs at least one output. Pass outputs=[...] explicitly.")
+    if not inputs:
+        raise ValueError(
+            f"The MATLAB function '{matlab_function}' declares no inputs; pass "
+            "inputs=[...] explicitly.")
+
+    entry = os.environ.get("REMDO_RT_MATLAB_ADAPTER_FUNCTION", "solve")
+    return await add_script_component(
+        name=name, script_path=adapter, inputs=list(inputs), outputs=list(outputs),
+        function=entry, runtime="matlab", call_style="positional",
+        config={"matlab_function": matlab_function,
+                "addpath": os.path.dirname(resolved)})
 
 
 @mcp.tool()
@@ -1598,11 +1817,14 @@ async def show_n2_diagram(outfile: str = "n2.html"):
              always written into ~/Downloads regardless of any directory parts.
     """
     require_problem()
-    _build()
     downloads = os.path.join(os.path.expanduser("~"), "Downloads")
     os.makedirs(downloads, exist_ok=True)
     out_path = os.path.join(downloads, os.path.basename(outfile))
-    om.n2(prob, outfile=out_path, show_browser=False)
+    # _quiet_stdout so a script component's prints or OpenMDAO's own output during
+    # build/n2 can't corrupt the JSON-RPC stream on stdout.
+    with _quiet_stdout():
+        _build()
+        om.n2(prob, outfile=out_path, show_browser=False)
     return f"N2 diagram written to: **{out_path}**"
 
 @mcp.tool()
@@ -1660,14 +1882,17 @@ async def check_partials(name: str = None):
                 "partials via add_component; 'fd'/'cs' pairs and ExecComp "
                 "disciplines are handled by OpenMDAO and need no check.")
 
-    _build()
-    prob.run_model()
     # An 'fd'/'cs' pair anywhere makes check_partials(method='fd') raise (checking
     # a numeric partial against numeric FD is meaningless), which would abort the
     # whole check. Suppress that one warning; we only report analytic pairs anyway.
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", OMInvalidCheckDerivativesOptionsWarning)
-        data = prob.check_partials(method="fd", out_stream=None)
+    # _quiet_stdout guards the build/run/check so a script's prints or a solver's
+    # output can't corrupt the JSON-RPC stream on stdout.
+    with _quiet_stdout():
+        _build()
+        prob.run_model()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", OMInvalidCheckDerivativesOptionsWarning)
+            data = prob.check_partials(method="fd", out_stream=None)
 
     lines = []
     for d, of, wrt in analytic:
