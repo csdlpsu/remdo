@@ -13,15 +13,32 @@ def test_openmdao_models_are_kept_outside_package():
     """OpenMDAO model files live in top-level ``openmdao/``, not ``src/remdo``."""
 
     repo_root = Path(__file__).resolve().parents[1]
-    model_names = [
+    openmdao_files = [
+        "openmdao_loader.py",
+        "problem_base.py",
         "satellite_openmdao.py",
         "aerostructures_openmdao.py",
         "turbine_openmdao.py",
+        "turbine_blade.STL",
+        "turbineFEM/turbineFEM.ctf",
     ]
 
-    for model_name in model_names:
+    for model_name in openmdao_files:
         assert (repo_root / "openmdao" / model_name).exists()
+
+    package_excluded_files = [
+        "problem_base.py",
+        "satellite_openmdao.py",
+        "aerostructures_openmdao.py",
+        "turbine_openmdao.py",
+        "turbine_blade.STL",
+        "turbineFEM/turbineFEM.ctf",
+    ]
+
+    for model_name in package_excluded_files:
         assert not (repo_root / "src" / "remdo" / model_name).exists()
+
+    assert not (repo_root / "src" / "remdo" / "turbineFEM").exists()
 
     assert not (repo_root / "openmdao" / "__init__.py").exists()
 

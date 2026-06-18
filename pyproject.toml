@@ -14,6 +14,3 @@ dev = ["pytest"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
-[tool.setuptools.package-data]
-remdo = ["turbine_blade.STL", "turbineFEM/*.ctf"]
