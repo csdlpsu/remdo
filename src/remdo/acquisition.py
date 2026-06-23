@@ -29,7 +29,7 @@ def z(x: torch.Tensor, model) -> torch.Tensor:
     """
 
     posterior = model.posterior(x)
-    return posterior.mean / posterior.stddev
+    return posterior.mean / posterior.stddev.unsqueeze(-1)
 
 
 def entropy(x: torch.Tensor, model) -> torch.Tensor:
@@ -121,7 +121,14 @@ def optimize_acquisition(
     else:
         x_samples_task = x_normalized
 
+    # print(x_samples_task.shape)
+
     sample_max_index = torch.argmax(acqf(x_samples_task, model))
+
+    # print("acqf:", acqf)
+    # print(acqf(x_samples_task, model).numel())
+    # print(sample_max_index)
+    
     x0 = x_normalized[sample_max_index]
     x0_scipy = torch.cat((x0, tensor([task_no]))) if task_no is not None else x0
 

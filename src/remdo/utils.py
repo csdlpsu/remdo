@@ -90,7 +90,7 @@ def unstandardize(X, y: torch.Tensor, specify_mean: float | None = None):
 
     y_mean = torch.as_tensor(specify_mean, dtype=y.dtype, device=y.device) if specify_mean is not None else y.mean()
     y_std = y.std()
-    return X * y_std + y_mean
+    return X * y_std.item() + y_mean.item()
 
 
 def sample_in_bounds(
