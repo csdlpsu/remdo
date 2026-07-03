@@ -85,7 +85,7 @@ def active_learning_loop(
     coupling_dim = problem.coupling_dim
 
     if isinstance(acq_method, str):
-        acq_func = _get_acq_func(acq_method)
+        acq_func = _get_acq_func(acq_method, model)
     elif callable(acq_method):
         acq_func = acq_method
     else:

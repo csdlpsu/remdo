@@ -28,8 +28,10 @@ def z(x: torch.Tensor, model) -> torch.Tensor:
         Tensor of standardized posterior mean values.
     """
 
-    posterior = model.posterior(x)
-    return posterior.mean / posterior.stddev.unsqueeze(-1)
+    # posterior = model.posterior(x)
+    # return posterior.mean / posterior.stddev.unsqueeze(-1)
+    posterior = model(x)
+    return posterior.mean / posterior.stddev
 
 
 def entropy(x: torch.Tensor, model) -> torch.Tensor:
@@ -50,6 +52,75 @@ def entropy(x: torch.Tensor, model) -> torch.Tensor:
     normal = Normal(as_tensor(0.0, dtype=x.dtype, device=x.device), as_tensor(1.0, dtype=x.dtype, device=x.device))
     probability = normal.cdf(z(x, model)).clamp_min(as_tensor(0.01, dtype=x.dtype, device=x.device))
     return -probability * torch.log(probability) - (1.0 - probability) * torch.log(1.01 - probability)
+
+def lsts(x: torch.Tensor, model, input_is_normalized=True) -> torch.Tensor:
+    """Level set Thompson sampling acquisition.
+
+    This acquisition selects points according to the probability that a 
+    particular level is achieved. More specifically, the value of this 
+    acquisition is large where the GP posterior mean is zero and where the
+    posterior variance is high.
+
+    The equality constraint on the GP posterior mean is encoded as a quadratic
+    penalty term.
+    
+    Args:
+        x: Candidate points in normalized coordinates, including task feature.
+        model: Trained multitask GP model.
+
+    Returns:
+        LSTS acquisition values for each candidate point.
+    """
+    if input_is_normalized:
+        x = model.input_transform.untransform(x)
+    posterior = model.posterior(x)
+
+    return posterior.variance
+
+from botorch.sampling.normal import SobolQMCNormalSampler
+
+def lsts_constraint(model, seed=None) -> Callable:
+    """Constraint for LSTS acquisition function.
+
+    Equality constraint on model posterior mean in SciPy format.
+    """
+    sampler = SobolQMCNormalSampler(torch.Size([1]), seed=seed)
+    
+    def eq_constraint(x):
+        x = model.input_transform.untransform(x)
+        posterior = model.posterior(x.unsqueeze(0))
+        return sampler(posterior).flatten() 
+    return [{'type':'eq', 'fun':eq_constraint}]
+    
+
+def lsts_penalty(x: torch.Tensor, model, penalty_coefficient: float = 100.0, seed=1111) -> torch.Tensor:
+    """Level set Thompson sampling acquisition.
+
+    This acquisition selects points according to the probability that a 
+    particular level is achieved. More specifically, the value of this 
+    acquisition is large where the GP posterior mean is zero and where the
+    posterior variance is high.
+
+    The equality constraint on the GP posterior mean is encoded as a quadratic
+    penalty term.
+    
+    Args:
+        x: Candidate points in normalized coordinates, including task feature.
+        model: Trained multitask GP model.
+
+    Returns:
+        LSTS acquisition values for each candidate point.
+    """
+
+    x_unnorm = model.input_transform.untransform(x)
+    posterior = model.posterior(x_unnorm)
+
+    sampler = SobolQMCNormalSampler(torch.Size([1]), seed=seed)
+    sample = sampler(posterior).flatten()
+    
+    penalty = 0.5 * penalty_coefficient * sample**2
+
+    return (posterior.variance.flatten() - penalty)
 
 
 def maximin(x: torch.Tensor, model) -> torch.Tensor:
@@ -87,8 +158,10 @@ def optimize_acquisition(
     acqf: AcquisitionFunction,
     task_no: int | None = None,
     method: str = "L-BFGS-B",
-    num_samples: int = 1000,
+    num_samples: int = 100,
     specify_input: list[float] | torch.Tensor | None = None,
+    constraints: list[dict] | None = None,
+    initial_guess: str = 'multistart'
 ):
     """Optimize an acquisition function over the problem bounds.
 
@@ -112,24 +185,24 @@ def optimize_acquisition(
 
     bounds = problem.bounds
     dim = bounds.size(1)
-    x_samples = sample_in_bounds(bounds, num_samples, specify_input)
-    x_normalized = normalize(x_samples, bounds)
 
-    if task_no is not None:
-        task_col = torch.full((num_samples, 1), task_no, dtype=x_normalized.dtype, device=x_normalized.device)
-        x_samples_task = torch.column_stack([x_normalized, task_col])
-    else:
-        x_samples_task = x_normalized
-
-    # print(x_samples_task.shape)
-
-    sample_max_index = torch.argmax(acqf(x_samples_task, model))
-
-    # print("acqf:", acqf)
-    # print(acqf(x_samples_task, model).numel())
-    # print(sample_max_index)
+    if initial_guess == 'multistart':
+        x_samples = sample_in_bounds(bounds, num_samples, specify_input)
+        x_normalized = normalize(x_samples, bounds)
     
-    x0 = x_normalized[sample_max_index]
+        if task_no is not None:
+            task_col = torch.full((num_samples, 1), task_no, dtype=x_normalized.dtype, device=x_normalized.device)
+            x_samples_task = torch.column_stack([x_normalized, task_col])
+        else:
+            x_samples_task = x_normalized
+
+        sample_max_index = torch.argmax(acqf(x_samples_task, model))
+        
+        x0 = x_normalized[sample_max_index]
+        
+    elif initial_guess == 'random':
+        x0 = torch.rand(dim, dtype=bounds.dtype, device=bounds.device)
+        
     x0_scipy = torch.cat((x0, tensor([task_no]))) if task_no is not None else x0
 
     bounds_norm = torch.stack(
@@ -156,14 +229,34 @@ def optimize_acquisition(
     def neg_acqf_grad(x, model):
         return -func_scipy(func_grad(acqf))(x, model)
 
+        
+    scipy_constraints = None
+    if constraints is not None:
+        scipy_constraints = []
+        for c in constraints:
+            wrapped = c.copy()
+
+            # wrap functions so they operate on torch -> numpy consistently
+            if "fun" in c:
+                f = c["fun"]
+                wrapped["fun"] = lambda x, f=f: to_numpy(f(tensor(x)))
+
+            if "jac" in c:
+                j = c["jac"]
+                wrapped["jac"] = lambda x, j=j: to_numpy(j(tensor(x)))
+
+            scipy_constraints.append(wrapped)
+
+
     result = minimize(
         neg_acqf,
         to_numpy(x0_scipy),
         method=method,
         args=model,
         jac=neg_acqf_grad,
-        options={"ftol": 1e-8},
+        options={"ftol": 1e-9},
         bounds=scipy_bounds,
+        constraints=scipy_constraints
     )
 
     result_x = tensor(result.x)
@@ -172,8 +265,11 @@ def optimize_acquisition(
         return unnormalize(result_x[:-1], bounds), result_value
     return unnormalize(result_x, bounds), result_value
 
-
-def multitask_acquisition(acqf: AcquisitionFunction, method: str) -> Callable:
+def multitask_acquisition(
+    acqf: AcquisitionFunction,
+    method: str,
+    constraints: list[dict] | Callable | None = None,
+) -> Callable:
     """Create an optimizer that chooses one point per residual task.
 
     Args:
@@ -187,7 +283,23 @@ def multitask_acquisition(acqf: AcquisitionFunction, method: str) -> Callable:
 
     def func(model, problem, disp: bool = False):
         del disp
-        return [optimize_acquisition(model, problem, acqf, task_id, method)[0] for task_id in problem.tasks]
+    
+        if callable(constraints):
+            optimizer_constraints = constraints(model)
+        else:
+            optimizer_constraints = constraints
+    
+        return [
+            optimize_acquisition(
+                model,
+                problem,
+                acqf,
+                task_id,
+                method,
+                constraints=optimizer_constraints,
+            )[0]
+            for task_id in problem.tasks
+        ]
 
     return func
 
@@ -239,11 +351,14 @@ def _get_acq_func(acquisition_name: str) -> Callable:
     """Map an acquisition name to a callable active-learning strategy.
 
     Args:
-        acquisition_name: One of ``"entropy"``, ``"maximin"``, ``"random"``,
-            or ``"mean entropy"``.
+        acquisition_name: Name of the acquisition strategy. Supported values
+            are ``"entropy"``, ``"lsts_penalty"``,
+            ``"lsts_constrained"``, ``"maximin"``, ``"random"``, and
+            ``"mean entropy"``.
 
     Returns:
-        Acquisition strategy callable.
+        A callable acquisition strategy configured according to
+        ``acquisition_name``.
 
     Raises:
         ValueError: If the acquisition name is unknown.
@@ -251,10 +366,15 @@ def _get_acq_func(acquisition_name: str) -> Callable:
 
     if acquisition_name == "entropy":
         return multitask_acquisition(entropy, method="L-BFGS-B")
-    if acquisition_name == "maximin":
+    if acquisition_name == "lsts_penalty":
+        return multitask_acquisition(lsts_penalty, method="L-BFGS-B")
+    elif acquisition_name == "lsts_constrained":
+        return multitask_acquisition(lsts, method="SLSQP", constraints=lsts_constraint)
+    elif acquisition_name == "maximin":
         return multitask_acquisition(maximin, method="COBYQA")
-    if acquisition_name == "random":
+    elif acquisition_name == "random":
         return random_acquisition()
-    if acquisition_name == "mean entropy":
+    elif acquisition_name == "mean entropy":
         return mean_acquisition(entropy, method="L-BFGS-B")
-    raise ValueError(f"Acquisition function '{acquisition_name}' undefined.")
+    else:
+        raise ValueError(f"Acquisition function '{acquisition_name}' undefined.")
