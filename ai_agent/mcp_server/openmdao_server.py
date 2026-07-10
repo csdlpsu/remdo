@@ -42,6 +42,7 @@ import pprint
 import importlib.util
 import json
 import select
+import shutil
 import subprocess
 import threading
 import atexit
@@ -49,6 +50,10 @@ import time
 import contextlib
 import sys
 import re
+
+# DAFoam container plumbing, shared with exported solve-pair compute files
+# (which bake its function sources verbatim so they stay standalone).
+from remdo import container as _remdo_container
 
 mcp = FastMCP("openmdao_mcp_server")
 
@@ -90,6 +95,31 @@ initial_values = {}   # flat 'discipline.variable' -> starting value
 approx_totals_cfg = {}
 promotions = []   # [{"promoted_name": str, "members": ["disc.var", ...]}]
 _script_modules = {}
+# Params of the most recent BATCHED residual evaluation (evaluate_residuals_batch or
+# evaluate_residual(samples=...)), so export_script(mode="residual_sweep") can bake the
+# same sweep into the emitted file's __main__ when no explicit main_sweep is passed.
+# {"sweeps": [...], "fixed_inputs": {...}} for a batch, {"samples": [...]} for samples.
+# None until a batched evaluation runs; reset by create_problem / define_problem.
+_last_residual_sweep = None
+
+# ---------------------------------------------------------------------------
+# MPhys composition state (aerostructural / aerodynamic scenarios built from
+# compiled solver builders — DAFoam, TACS, MELD). Recorded by add_builder /
+# add_mphys_scenario / add_geometry_ffd exactly like the plain declarative
+# state above; NOTHING is instantiated at tool-call time (the builders only
+# exist inside the DAFoam Docker image). Composition happens solely in the
+# generated runscript (_generate_mphys_script), executed via run_job or handed
+# back via export_script. While any MPhys state is present the in-process
+# build/eval tools refuse (see _require_no_mphys).
+# ---------------------------------------------------------------------------
+mphys_builders = []    # [{"name", "kind", "options", "callables"}] in add order
+mphys_scenarios = []   # [{"name", "type", "builders", "nl_solver", "ln_solver"}]
+mphys_geometry = None  # add_geometry_ffd spec dict (one FFD geometry per problem)
+driver_cfg = None      # set_optimizer record: {"family", "optimizer", "opt_settings",
+                       #  "debug_print", "print_opt_prob", "hist_file"}
+objective_scaler = None
+_mphys_jobs = {}       # job_id -> {"proc", "workdir", "task", "log", "script", "t0"}
+_mphys_job_seq = [0]   # monotonically increasing job-id counter (list = mutable)
 
 
 def require_problem():
@@ -1206,13 +1236,15 @@ def _build():
                              "use only one mechanism for it.")
         prob.model.connect(_full_name(src), _full_name(tgt))  # your existing connect line
     if objective is not None:
-        prob.model.add_objective(_full_name(objective))
+        prob.model.add_objective(_full_name(objective), scaler=objective_scaler)
     for dv in design_vars:
         prob.model.add_design_var(_full_name(dv["name"]),
-                                  lower=dv["lower"], upper=dv["upper"])
+                                  lower=dv["lower"], upper=dv["upper"],
+                                  scaler=dv.get("scaler"))
     for c in constraints:
         prob.model.add_constraint(_full_name(c["name"]),
-                                  lower=c["lower"], upper=c["upper"], equals=c["equals"])
+                                  lower=c["lower"], upper=c["upper"], equals=c["equals"],
+                                  scaler=c.get("scaler"), linear=bool(c.get("linear")))
 
     # Execution order: OpenMDAO runs subsystems in add order, so a consumer
     # added before its producer (as define_problem's category ordering can do)
@@ -1252,7 +1284,12 @@ def _build():
     # Apply recorded initial values. set_val() requires a set-up model, and the
     # model is rebuilt (and re-setup) on every _build(), so seeded values do not
     # persist on their own — they are re-applied here after each setup().
+    # An MPhys-owned name (promoted/scenario path, e.g. 'patchV') exists only in
+    # the generated script's model, never in this in-process build — skip it.
+    known = {d["name"] for d in disciplines}
     for flat, val in initial_values.items():
+        if _mphys_active() and flat.split(".", 1)[0] not in known:
+            continue
         prob.set_val(_full_name(flat), val)
 
 def _emit_print(label, path):
@@ -1425,13 +1462,19 @@ def _generate_script():
 
     opt_lines = []
     if objective is not None:
-        opt_lines.append(f"prob.model.add_objective({_full_name(objective)!r})")
+        okw = f", scaler={objective_scaler!r}" if objective_scaler is not None else ""
+        opt_lines.append(f"prob.model.add_objective({_full_name(objective)!r}{okw})")
     for dv in design_vars:
+        kw = f", scaler={dv['scaler']!r}" if dv.get("scaler") is not None else ""
         opt_lines.append(f"prob.model.add_design_var({_full_name(dv['name'])!r}, "
-                         f"lower={dv['lower']!r}, upper={dv['upper']!r})")
+                         f"lower={dv['lower']!r}, upper={dv['upper']!r}{kw})")
     for c in constraints:
+        kw = f", scaler={c['scaler']!r}" if c.get("scaler") is not None else ""
+        if c.get("linear"):
+            kw += ", linear=True"
         opt_lines.append(f"prob.model.add_constraint({_full_name(c['name'])!r}, "
-                         f"lower={c['lower']!r}, upper={c['upper']!r}, equals={c['equals']!r})")
+                         f"lower={c['lower']!r}, upper={c['upper']!r}, "
+                         f"equals={c['equals']!r}{kw})")
     if opt_lines:
         L.append("# Objective / design variables / constraints."); L += opt_lines; L.append("")
 
@@ -1520,9 +1563,86 @@ def _fill_dict_literal(d, prefix, width=88):
     return "\n".join(lines)
 
 
+def _normalize_sweep_spec(spec, default_increment=0.1):
+    """A sweep spec dict -> {'variable','start','stop','increment'} with float bounds,
+    or ValueError if a required field is missing/non-numeric. Mirrors the grid spec
+    evaluate_residuals_batch accepts so the baked MAIN_SWEEP and the live sweep agree."""
+    if not isinstance(spec, dict):
+        raise ValueError("a sweep spec must be an object with 'variable', 'start', "
+                         "'stop' and optional 'increment'.")
+    try:
+        var = spec["variable"]
+        start = float(spec["start"])
+        stop = float(spec["stop"])
+    except KeyError as e:
+        raise ValueError(f"sweep spec missing required field {e}.")
+    except (TypeError, ValueError):
+        raise ValueError("sweep spec 'start'/'stop' must be numeric.")
+    if not isinstance(var, str) or not var:
+        raise ValueError("sweep spec 'variable' must be a non-empty 'disc.var' string.")
+    try:
+        inc = float(spec.get("increment", default_increment))
+    except (TypeError, ValueError):
+        raise ValueError("sweep spec 'increment' must be numeric.")
+    if inc == 0:
+        raise ValueError("sweep spec 'increment' must be non-zero.")
+    return {"variable": var, "start": start, "stop": stop, "increment": inc}
+
+
+def _derive_sweep_from_samples(samples):
+    """Best-effort (sweep_spec_or_None, fixed_inputs) for a list of u dicts: a key
+    present with one identical value in EVERY sample is fixed; if exactly one other key
+    varies over a uniform scalar grid it becomes the swept axis. Returns the fixed
+    inputs regardless (useful as coupling guesses even when no clean axis exists)."""
+    samples = [s for s in samples if isinstance(s, dict)]
+    if not samples:
+        return None, {}
+    keys = sorted(set().union(*[set(s) for s in samples]))
+    fixed, varying = {}, []
+    for k in keys:
+        present = [s[k] for s in samples if k in s]
+        if len(present) == len(samples) and len({repr(v) for v in present}) == 1:
+            fixed[k] = present[0]
+        else:
+            varying.append(k)
+    if len(varying) != 1:
+        return None, fixed
+    var = varying[0]
+    try:
+        vals = [float(s[var]) for s in samples]
+    except (KeyError, TypeError, ValueError):
+        return None, fixed
+    uniq = sorted(set(vals))
+    if len(uniq) < 2:
+        return None, fixed
+    steps = [round(b - a, 12) for a, b in zip(uniq, uniq[1:])]
+    if len(set(steps)) != 1:
+        return None, fixed     # not a uniform grid — no clean single-axis sweep
+    return ({"variable": var, "start": uniq[0], "stop": uniq[-1],
+             "increment": steps[0]}, fixed)
+
+
+def _resolve_remembered_sweep(record):
+    """(sweep_spec_or_None, fixed_inputs) for the most recent batched residual
+    evaluation: an evaluate_residuals_batch (its first sweep spec + fixed_inputs) or an
+    evaluate_residual(samples=...) (a single-axis grid derived from the samples, with
+    the constant keys as fixed_inputs)."""
+    if not record:
+        return None, {}
+    sweeps = record.get("sweeps")
+    if sweeps:
+        return (_normalize_sweep_spec(sweeps[0], record.get("default_increment", 0.1)),
+                dict(record.get("fixed_inputs") or {}))
+    samples = record.get("samples")
+    if samples:
+        return _derive_sweep_from_samples(samples)
+    return None, dict(record.get("fixed_inputs") or {})
+
+
 def _generate_residual_script(decompose="leaf", return_map=False, include_outputs=None,
                               setup_module="openmdao_model_residual_setup",
-                              sweep=False):
+                              sweep=False, main_sweep=None, main_fixed_inputs=None,
+                              from_file=None):
     """Emit the SETUP/COMPUTE pair of standalone, IMPORTABLE Python files whose
     residuals(u) reproduces exactly what evaluate_residual computes: the decoupled
     multidisciplinary consistency residual r(u) = u_supplied - f(x, u) (leaf
@@ -1553,6 +1673,15 @@ def _generate_residual_script(decompose="leaf", return_map=False, include_output
        (the evaluate_residual samples= twin) and residuals_sweep() (the
        evaluate_residuals_batch twin) and a self-running demo sweep. The SETUP half
        is byte-for-byte identical either way; only the compute half differs.
+    from_file: when given (a dict {'points_file': abs_path, 'variable_names':
+       list|None}), emit the FROM-FILE compute file instead of the single-point or
+       sweep variant — the same residuals() kernel plus a loader that reads a CSV /
+       .xlsx / .npy file of points (one row per augmented input u) and a __main__
+       that evaluates residuals() at each row, best-effort skip-and-continue, and
+       prints per-row progress then an ok/error summary (stdout only, no results
+       file). The SETUP half is byte-for-byte identical to the other variants; only
+       the compute half differs. Mutually exclusive with sweep (this branch returns
+       first). Backs the evaluate_residuals_from_file tool.
 
     Out of scope for v1: decompose='group' codegen (see above)."""
     require_problem()
@@ -1577,12 +1706,53 @@ def _generate_residual_script(decompose="leaf", return_map=False, include_output
     emit_discs = [d for d in disciplines if d["name"] in by_unit]
     sizes = _resolve_sizes([d["name"] for d in disciplines], initial_values)
 
+    coupling_inputs_map = dict(sorted(consumer_to_var.items()))
+    coupling_vars_list = sorted(coupling_vars)
+
+    # Inverse of COUPLING_INPUTS: each coupling variable -> the consumer input(s) that
+    # read it (sorted), so a guess can be resolved from a consumer-side seed.
+    inverse = {}
+    for _ci, _cv in coupling_inputs_map.items():
+        inverse.setdefault(_cv, []).append(_ci)
+
+    # In-effect coupling guesses, keyed by PRODUCING output (the coupling variable),
+    # resolved per cv by priority:
+    #   (i-a) a recorded initial value under cv itself (a producing-output seed); else
+    #   (i-b) the recorded value of a consumer input ci with COUPLING_INPUTS[ci]==cv
+    #         (consumer-side seed — the reliably-recorded path); else
+    #   (ii)  the guess held in the most recent residual evaluation (main_fixed_inputs,
+    #         from evaluate_residuals_batch / evaluate_residual(samples=...) — Change C),
+    #         looked up under cv or any consumer input that reads it.
+    # An unresolvable cv is omitted; residuals() then demands it in u, as before.
+    main_fixed_inputs = main_fixed_inputs or {}
+    coupling_guesses = {}
+    for cv in coupling_vars_list:
+        val = _resolve_value(cv, {})                        # (i-a) recorded under cv
+        if val is None:                                     # (i-b) recorded on consumer
+            for ci in inverse.get(cv, []):
+                cval = _resolve_value(ci, {})
+                if cval is not None:
+                    val = cval
+                    break
+        if val is None:                                     # (ii) last evaluation's guess
+            if cv in main_fixed_inputs:
+                val = main_fixed_inputs[cv]
+            else:
+                for ci in inverse.get(cv, []):
+                    if ci in main_fixed_inputs:
+                        val = main_fixed_inputs[ci]
+                        break
+        if val is not None:
+            coupling_guesses[cv] = val
+
     # Bake the augmented point. For each producing unit's NON-coupling input, the
     # promotion-aware recorded value (so a single promoted seed feeds every sibling,
-    # exactly as the oracle's _shared_value resolves it); for each coupling variable,
-    # the recorded guess. A coupling INPUT gets no state entry — it is driven from
-    # its producing output's value via COUPLING_INPUTS. Anything unrecorded is left
-    # to the component default (1.0) at run time, matching the oracle.
+    # exactly as the oracle's _shared_value resolves it). The coupling guesses resolved
+    # above are folded in too (keyed by producing output) so residuals() runs with NO u
+    # — the KeyError the severed kernel would otherwise raise for an unsupplied coupling
+    # variable is pre-empted (Change A). A coupling INPUT gets no state entry — it is
+    # driven from its producing output's guess via COUPLING_INPUTS. Anything unrecorded
+    # is left to the component default (1.0) at run time, matching the oracle.
     recorded_state = {}
     unit_inputs = {}
     for d in emit_discs:
@@ -1596,10 +1766,7 @@ def _generate_residual_script(decompose="leaf", return_map=False, include_output
             val = _shared_value(full, {})
             if val is not None:
                 recorded_state[full] = val
-    for cv in sorted(coupling_vars):
-        val = _resolve_value(cv, {})
-        if val is not None:
-            recorded_state[cv] = val
+    recorded_state.update(coupling_guesses)
 
     # Promotion siblings, so a u override on any one promoted endpoint overrides all
     # of them (the oracle's _shared_value scans every sibling). Only endpoints the
@@ -1609,9 +1776,6 @@ def _generate_residual_script(decompose="leaf", return_map=False, include_output
         sibs = _promotion_siblings(flat)
         if len(sibs) > 1:
             promo_sibs[flat] = sibs
-
-    coupling_inputs_map = dict(sorted(consumer_to_var.items()))
-    coupling_vars_list = sorted(coupling_vars)
 
     # =======================================================================
     # SETUP FILE (S): support code, baked constants, builder, PROB singleton.
@@ -1662,30 +1826,12 @@ def _generate_residual_script(decompose="leaf", return_map=False, include_output
           'PROB = _build_decoupled()',
           '']
 
-    # BAKED_U: a demo point covering every coupling variable, resolved at EXPORT
-    # time from recorded initial values. It is NOT folded into RECORDED_STATE (which
-    # stays x-only so the sweep contract — coupling vars are the swept inputs — stays
-    # unambiguous); it lives in the compute file's __main__ only so a bare run has a
-    # value for every coupling guess. For each coupling var cv resolve by priority:
-    #   (1) a recorded initial value under cv itself (a producing-output seed); else
-    #   (2) the recorded value of a consumer input ci with COUPLING_INPUTS[ci] == cv
-    #       (consumer-side seeds, the reliably-recorded path). Unresolvable cv omitted.
-    inverse = {}
-    for _ci, _cv in coupling_inputs_map.items():
-        inverse.setdefault(_cv, []).append(_ci)   # sorted-order consumer inputs per cv
-    baked_u = {}
-    for cv in coupling_vars_list:
-        val = _resolve_value(cv, {})                        # (1) recorded under cv
-        if val is None:                                     # (2) invert COUPLING_INPUTS
-            for ci in inverse.get(cv, []):
-                cval = _resolve_value(ci, {})
-                if cval is not None:
-                    val = cval
-                    break
-        if val is not None:
-            baked_u[cv] = val
+    # BAKED_U mirrors the coupling guesses folded into RECORDED_STATE above (same
+    # producing-output keys, same resolution order: recorded seeds, else the most recent
+    # evaluation's held guesses). It backs the demo __main__'s coupling-guess fallback.
+    baked_u = dict(coupling_guesses)
     baked_line = (f"BAKED_U = {baked_u!r}  "
-                  "# resolved from recorded initial values; {} if none")
+                  "# coupling guesses from recorded seeds / last evaluation; {} if none")
 
     # =======================================================================
     # COMPUTE FILE (C): the residuals() kernel + a __main__ runner, importing the
@@ -1738,6 +1884,118 @@ def _generate_residual_script(decompose="leaf", return_map=False, include_output
         "    return result, float(np.linalg.norm(_stack))",
     ]
 
+    if from_file is not None:
+        # FROM-FILE compute variant: load a user-supplied file of points (one row =
+        # one augmented input u) and evaluate residuals() at every row, best-effort
+        # skip-and-continue. The setup half (S) is byte-identical to the other
+        # variants; only this compute half differs. stdout only — no results file.
+        points_file = from_file["points_file"]
+        variable_names = from_file.get("variable_names")
+        ext = os.path.splitext(points_file)[1].lower()
+        # openpyxl is only needed for .xlsx; flag it so a fresh machine knows to install
+        # it (it is NOT a hard import here — pandas pulls it in only for read_excel).
+        notes = (["# requires: pip install openpyxl  (to read the .xlsx points file)"]
+                 if ext == ".xlsx" else [])
+        loader = [
+            "",
+            "",
+            "# Points file — edit this path if the file moves.",
+            f"POINTS_FILE = {points_file!r}",
+            f"VARIABLE_NAMES = {variable_names!r}  # column names in order; overrides "
+            "headers (CSV/XLSX), required for plain .npy",
+            "",
+            "",
+            "def _coerce(_v):",
+            '    """A numpy scalar/array cell -> a plain python float (scalar) or list."""',
+            "    _a = np.asarray(_v)",
+            "    return _a.item() if _a.ndim == 0 else _a.tolist()",
+            "",
+            "",
+            "def _rows_from_dataframe(_df):",
+            "    _names = list(_df.columns)",
+            "    return [dict(zip(_names, [_coerce(_v) for _v in _row]))",
+            "            for _row in _df.to_numpy()]",
+            "",
+            "",
+            "def _load_points():",
+            '    """Load POINTS_FILE into a list of {variable_name: value} dicts, one per',
+            '    row. The format is dispatched on the file extension. CSV/XLSX use the',
+            '    header row as variable names unless VARIABLE_NAMES overrides them; a',
+            '    structured .npy uses its field names; a plain .npy needs VARIABLE_NAMES."""',
+            "    import os",
+            "    _ext = os.path.splitext(POINTS_FILE)[1].lower()",
+            '    if _ext == ".csv":',
+            "        import pandas as pd",
+            "        _df = pd.read_csv(POINTS_FILE)",
+            "        if VARIABLE_NAMES is not None:",
+            "            _df.columns = VARIABLE_NAMES",
+            "        return _rows_from_dataframe(_df)",
+            '    if _ext == ".xlsx":',
+            "        import pandas as pd",
+            "        _df = pd.read_excel(POINTS_FILE)  # requires openpyxl",
+            "        if VARIABLE_NAMES is not None:",
+            "            _df.columns = VARIABLE_NAMES",
+            "        return _rows_from_dataframe(_df)",
+            '    if _ext == ".npy":',
+            "        _arr = np.load(POINTS_FILE, allow_pickle=False)",
+            "        if _arr.dtype.names:  # structured array carries its own field names",
+            "            _names = list(_arr.dtype.names)",
+            "            return [{_n: _coerce(_row[_n]) for _n in _names} for _row in _arr]",
+            "        if VARIABLE_NAMES is None:",
+            "            raise ValueError(\"a plain .npy array needs VARIABLE_NAMES "
+            "(column names); none were baked into this script.\")",
+            "        if _arr.ndim != 2 or _arr.shape[1] != len(VARIABLE_NAMES):",
+            "            raise ValueError(f\".npy array shape {_arr.shape} does not match \"",
+            "                             f\"{len(VARIABLE_NAMES)} variable name(s) "
+            "{VARIABLE_NAMES}.\")",
+            "        return [dict(zip(VARIABLE_NAMES, [_coerce(_v) for _v in _row]))",
+            "                for _row in _arr]",
+            "    raise ValueError(f\"unsupported points-file extension {_ext!r}; use "
+            ".csv, .xlsx, or .npy.\")",
+            "",
+            "",
+            "# Every variable the decoupled model knows: each producing unit's inputs plus",
+            "# the coupling/residual-target outputs. A u key outside this set is reported",
+            "# as an unknown variable and that row is skipped (see __main__).",
+            "KNOWN_VARS = (set(COUPLING_VARS)",
+            "              | {f\"{_u}.{_v}\" for _u, _ins in UNIT_INPUTS.items() "
+            "for _v in _ins})",
+        ]
+        main = [
+            "",
+            "",
+            'if __name__ == "__main__":',
+            "    _results = []",
+            "    _n_ok = _n_err = 0",
+            "    for _i, _point in enumerate(_load_points()):",
+            "        _unknown = [_k for _k in _point if _k not in KNOWN_VARS]",
+            "        if _unknown:",
+            '            _reason = "unknown variable: " + ", ".join(map(str, _unknown))',
+            '            _results.append({"row_index": _i, "status": "error",',
+            '                             "point": _point, "reason": _reason})',
+            "            print(f\"[row {_i}] ERROR  {_reason}\")",
+            "            _n_err += 1",
+            "            continue",
+            "        try:",
+            "            _res, _norm = residuals(u=_point)",
+            '            _results.append({"row_index": _i, "status": "ok", '
+            '"point": _point,',
+            '                             "residuals": {_k: _res[_k].tolist() '
+            "for _k in sorted(_res)},",
+            '                             "l2_norm": _norm})',
+            "            print(f\"[row {_i}] ok     ||r||2 = {_norm:.6g}\")",
+            "            _n_ok += 1",
+            "        except Exception as _e:",
+            '            _results.append({"row_index": _i, "status": "error",',
+            '                             "point": _point, "reason": str(_e)})',
+            "            print(f\"[row {_i}] ERROR  {_e}\")",
+            "            _n_err += 1",
+            "    print(f\"\\nsummary: {_n_ok} ok, {_n_err} error \"",
+            "          f\"({_n_ok + _n_err} rows total)\")",
+        ]
+        C = header[:1] + notes + header[1:] + kernel + loader + main
+        return "\n".join(S) + "\n", "\n".join(C) + "\n"
+
     if not sweep:
         # Single-point file: residuals() + a BAKED_U __main__ that runs the recorded
         # demo point bare (BAKED_U supplies the coupling guesses RECORDED_STATE omits).
@@ -1754,10 +2012,11 @@ def _generate_residual_script(decompose="leaf", return_map=False, include_output
         ]
         return "\n".join(S) + "\n", "\n".join(C) + "\n"
 
-    # Sweep file: the same residuals() kernel plus the two batch helpers — the
-    # offline twins of evaluate_residual(samples=...) and evaluate_residuals_batch —
-    # and a self-running demo sweep centered on the first baked coupling guess.
-    C = header + kernel + [
+    # Sweep file: the same residuals() kernel plus the two batch helpers — the offline
+    # twins of evaluate_residual(samples=...) and evaluate_residuals_batch. Its __main__
+    # runs the remembered/explicit design sweep (MAIN_SWEEP) when one is available
+    # (Change B/C), else the legacy coupling-guess demo, which exits 0.
+    sweep_helpers = [
         "",
         "",
         "def residuals_batch(samples, return_map=_DEFAULT_RETURN_MAP):",
@@ -1822,34 +2081,819 @@ def _generate_residual_script(decompose="leaf", return_map=False, include_output
         '                    "error": str(_e),',
         "                })",
         "    return results",
-        "",
-        "",
-        baked_line,
-        "",
-        'if __name__ == "__main__":',
-        "    # Demo: sweep the first baked coupling guess over [0.8c, 1.2c] in 5",
-        "    # points, holding everything else at the recorded values.",
-        "    _axis = next((_cv for _cv in COUPLING_VARS if _cv in BAKED_U), None)",
-        "    if _axis is None:",
-        "        print(\"No baked coupling guess to center a demo sweep on. Call e.g. \"",
-        "              \"residuals_sweep([{'variable': 'd1.x1', 'start': 0.0, \"",
-        "              \"'stop': 1.0, 'increment': 0.1}]).\")",
-        "    else:",
-        "        _c = float(np.asarray(BAKED_U[_axis], dtype=float).flatten()[0])",
-        "        _start, _stop = 0.8 * _c, 1.2 * _c",
-        "        _inc = (_stop - _start) / 4 or 0.1",
-        "        _rows = residuals_sweep([{\"variable\": _axis, \"start\": _start,",
-        "                                  \"stop\": _stop, \"increment\": _inc}])",
-        "        print(f\"sweep of {_axis} over \"",
-        "              f\"[{_start:.6g}, {_stop:.6g}] in {len(_rows)} points:\")",
-        "        print(\"swept_value, l2_norm\")",
-        "        for _r in _rows:",
-        "            if \"error\" in _r:",
-        "                print(f\"{_r['swept_value']:.6g}, ERROR: {_r['error']}\")",
-        "            else:",
-        "                print(f\"{_r['swept_value']:.6g}, {_r['l2_norm']:.6g}\")",
+    ]
+
+    C = header + kernel + sweep_helpers + ["", "", baked_line]
+    if main_sweep is not None:
+        # Change B/C: bake the resolved design sweep and emit the table __main__ the
+        # task specifies — residuals_sweep([MAIN_SWEEP], fixed_inputs=MAIN_FIXED_INPUTS),
+        # one row per swept value (each coupling residual, the per-point ||r||2), then
+        # the stacked norm over the whole sweep.
+        C += [
+            "",
+            f"MAIN_SWEEP = {main_sweep!r}",
+            f"MAIN_FIXED_INPUTS = {main_fixed_inputs!r}",
+            "",
+            'if __name__ == "__main__":',
+            "    import numpy as np",
+            "    rows = residuals_sweep([MAIN_SWEEP], fixed_inputs=MAIN_FIXED_INPUTS)",
+            "    cvars = COUPLING_VARS",
+            "    print(f\"{'value':>8} \" + \" \".join(f\"{c:>13}\" for c in cvars) "
+            "+ f\"{'||r||2':>13}\")",
+            "    for r in rows:",
+            "        if \"error\" in r:",
+            "            print(f\"{r['swept_value']:8.3f}  ERROR: {r['error']}\"); continue",
+            "        vals = \" \".join(f\"{r['residuals'][c][0]:13.5f}\" for c in cvars)",
+            "        print(f\"{r['swept_value']:8.3f} {vals} {r['l2_norm']:13.5f}\")",
+            "    stack = np.concatenate([np.asarray(r[\"residuals\"][c]).ravel()",
+            "                            for r in rows if \"error\" not in r for c in cvars])",
+            "    print(f\"\\nstacked ||r||2 = {float(np.linalg.norm(stack)):.5f}  "
+            "(n={len(rows)})\")",
+        ]
+    else:
+        # Fallback: nothing remembered or supplied. Center an illustrative sweep on the
+        # first baked coupling guess (±20%); if there is none, print a hint and EXIT 0
+        # rather than leaving the run inertly empty.
+        C += [
+            "",
+            'if __name__ == "__main__":',
+            "    _axis = next((_cv for _cv in COUPLING_VARS if _cv in BAKED_U), None)",
+            "    if _axis is None:",
+            "        print(\"No baked coupling guess to center a demo sweep on, and no \"",
+            "              \"sweep was remembered at export. Call e.g. residuals_sweep([\"",
+            "              \"{'variable': 'd1.x1', 'start': 0.0, 'stop': 1.0, \"",
+            "              \"'increment': 0.1}]).\")",
+            "        raise SystemExit(0)",
+            "    _c = float(np.asarray(BAKED_U[_axis], dtype=float).flatten()[0])",
+            "    _start, _stop = 0.8 * _c, 1.2 * _c",
+            "    _inc = (_stop - _start) / 4 or 0.1",
+            "    _rows = residuals_sweep([{\"variable\": _axis, \"start\": _start,",
+            "                              \"stop\": _stop, \"increment\": _inc}])",
+            "    print(f\"sweep of {_axis} over \"",
+            "          f\"[{_start:.6g}, {_stop:.6g}] in {len(_rows)} points:\")",
+            "    print(\"swept_value, l2_norm\")",
+            "    for _r in _rows:",
+            "        if \"error\" in _r:",
+            "            print(f\"{_r['swept_value']:.6g}, ERROR: {_r['error']}\")",
+            "        else:",
+            "            print(f\"{_r['swept_value']:.6g}, {_r['l2_norm']:.6g}\")",
     ]
     return "\n".join(S) + "\n", "\n".join(C) + "\n"
+
+
+# ===========================================================================
+# MPhys: shared script generator, file staging, and the Docker job runner.
+#
+# The composition state (mphys_builders / mphys_scenarios / mphys_geometry) is
+# turned into a runnable Top(Multipoint) script HERE and only here — both
+# export_script (hand the script back) and run_job (execute it in the DAFoam
+# container) call _generate_mphys_script, so the two endpoints can never drift.
+# The DAFoam Docker image is used purely as a box of pre-installed compiled
+# solvers: the only interaction is `docker exec` of the generated script.
+# ===========================================================================
+
+_MPHYS_BUILDER_KINDS = ("dafoam", "tacs", "meld")
+_MPHYS_SCENARIO_TYPES = {
+    # type -> (scenario class, its import module, mesh subsystem per role)
+    "aerostructural": ("ScenarioAeroStructural", "mphys.scenario_aerostructural",
+                       {"dafoam": "mesh_aero", "tacs": "mesh_struct"}),
+    "aerodynamic": ("ScenarioAerodynamic", "mphys.scenario_aerodynamic",
+                    {"dafoam": "mesh"}),
+}
+_PYOPTSPARSE_DEFAULTS = {
+    "SLSQP": {"ACC": 1.0e-6, "MAXIT": 100, "IFILE": "opt_SLSQP.txt"},
+    "IPOPT": {"tol": 1.0e-5, "constr_viol_tol": 1.0e-5, "max_iter": 100,
+              "print_level": 5, "output_file": "opt_IPOPT.txt",
+              "mu_strategy": "adaptive", "limited_memory_max_history": 10,
+              "nlp_scaling_method": "none", "alpha_for_y": "full",
+              "recalc_y": "yes"},
+    "SNOPT": {"Major feasibility tolerance": 1.0e-5,
+              "Major optimality tolerance": 1.0e-5,
+              "Minor feasibility tolerance": 1.0e-5, "Verify level": -1,
+              "Function precision": 1.0e-5, "Major iterations limit": 100,
+              "Nonderivative linesearch": None,
+              "Print file": "opt_SNOPT_print.txt",
+              "Summary file": "opt_SNOPT_summary.txt"},
+}
+_MPHYS_TASKS = ("run_model", "run_driver", "compute_totals", "check_totals")
+
+# Docker execution configuration (env-overridable; defaults match the stock
+# dafoam_mcp_server container setup on this machine).
+_DAFOAM_CONTAINER = os.environ.get("REMDO_DAFOAM_CONTAINER", "dafoam_mcp_server")
+_DAFOAM_IMAGE = os.environ.get("REMDO_DAFOAM_IMAGE", "dafoam_mcp_server:latest")
+_DAFOAM_ENV_SH = os.environ.get("REMDO_DAFOAM_ENV_SH",
+                                "/home/dafoamuser/dafoam/loadDAFoam.sh")
+
+
+def _mphys_active():
+    return bool(mphys_builders or mphys_scenarios)
+
+
+def _require_no_mphys(tool, alternative):
+    """Guardrail: refuse an in-process tool that would silently do the wrong
+    (or an impossibly expensive) thing on an MPhys problem, whose solvers only
+    exist inside the DAFoam container."""
+    if _mphys_active():
+        raise ValueError(
+            f"{tool} is not available for an MPhys problem: the builders "
+            f"(DAFoam/TACS/MELD) are compiled solvers that exist only inside the "
+            f"DAFoam Docker image, not in this server's Python. Use {alternative}.")
+
+
+def _find_builder(name):
+    for b in mphys_builders:
+        if b["name"] == name:
+            return b
+    return None
+
+
+def _check_var_owner(name):
+    """Discipline-existence check for objective/DV/constraint/initial-value
+    names, RELAXED under MPhys: an MPhys problem's names are promoted top-level
+    or scenario-scoped paths ('twist', 'scenario1.aero_post.CD',
+    'geometry.volcon') that belong to no recorded discipline — they resolve only
+    inside the generated script, so any string is accepted then. A name whose
+    first segment IS a recorded discipline is still validated as before."""
+    sub = name.split(".", 1)[0]
+    if sub in {d["name"] for d in disciplines}:
+        return
+    if _mphys_active():
+        return
+    raise ValueError(f"No discipline named '{sub}'. Add it first.")
+
+
+def _builders_by_kind(names):
+    """{kind: builder_record} for a scenario's participating builder names."""
+    out = {}
+    for n in names:
+        b = _find_builder(n)
+        out[b["kind"]] = b
+    return out
+
+
+class _Raw(str):
+    """A string whose repr is itself — lets a code reference (e.g.
+    tacsSetup.element_callback) sit inside an options dict emitted via repr."""
+    def __repr__(self):
+        return str(self)
+
+
+def _raw_tokens(obj):
+    """Deep-copy an options structure, turning the literal string 'os.getcwd()'
+    into raw code so the generated script resolves it at RUN time in the case
+    directory (the stock runscripts use it for meshOptions['gridFile'])."""
+    if isinstance(obj, dict):
+        return {k: _raw_tokens(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_raw_tokens(v) for v in obj]
+    if isinstance(obj, str) and obj == "os.getcwd()":
+        return _Raw("os.getcwd()")
+    return obj
+
+
+def _callable_modules():
+    """Distinct module stems of every callback file recorded on the builders,
+    in first-reference order (e.g. ['tacsSetup'])."""
+    mods = []
+    for b in mphys_builders:
+        for ref in (b.get("callables") or {}).values():
+            stem = os.path.splitext(os.path.basename(ref["file"]))[0]
+            if stem not in mods:
+                mods.append(stem)
+    return mods
+
+
+def _callable_files():
+    """Distinct callback file refs as recorded (absolute or relative)."""
+    files = []
+    for b in mphys_builders:
+        for ref in (b.get("callables") or {}).values():
+            if ref["file"] not in files:
+                files.append(ref["file"])
+    return files
+
+
+def _stage_mphys_files(dest_dir, search_dirs=()):
+    """Copy every recorded callback file (e.g. tacsSetup.py) next to the
+    generated script so its `import tacsSetup` resolves. An absolute ref is
+    copied from where it points; a relative ref is resolved against
+    search_dirs and dest_dir (already-in-place files are left alone).
+    Returns (staged_paths, missing_refs)."""
+    staged, missing = [], []
+    for ref in _callable_files():
+        base = os.path.basename(ref)
+        dest = os.path.join(dest_dir, base)
+        if os.path.isabs(ref):
+            cands = [ref]
+        else:
+            cands = [os.path.join(d, ref) for d in (*search_dirs, dest_dir)]
+        src = next((c for c in cands if os.path.isfile(c)), None)
+        if src is None:
+            missing.append(ref)
+            continue
+        if not (os.path.exists(dest) and os.path.samefile(src, dest)):
+            shutil.copyfile(src, dest)
+        staged.append(dest)
+    return staged, missing
+
+
+def _kwargs_src(d):
+    """dict -> 'k1=v1, k2=v2' source text (reprs), insertion order kept."""
+    return ", ".join(f"{k}={v!r}" for k, v in d.items())
+
+
+def _normalize_trim(trim):
+    """Validate the curated trim step (DAFoam OptFuncs.findFeasibleDesign) and
+    normalize it to {function, design_var, target, component}. Not a generic
+    pre-run hook — exactly the named CL-trim pattern from the MACH runscript."""
+    if trim is None:
+        return None
+    _fields(trim, {"function", "design_var", "target", "component"}, "trim")
+    for req in ("function", "design_var", "target"):
+        if req not in trim:
+            raise ValueError(f"trim: missing required field '{req}' "
+                             "(e.g. {'function': 'scenario1.aero_post.CL', "
+                             "'design_var': 'patchV', 'target': 0.5, 'component': 1}).")
+    return {"function": trim["function"], "design_var": trim["design_var"],
+            "target": float(trim["target"]),
+            "component": None if trim.get("component") is None
+            else int(trim["component"])}
+
+
+def _mphys_import_lines(runner=True):
+    """Import lines for a generated MPhys file. runner=True is the stock list
+    for a file that RUNS the problem (the monolithic runscript, the compute
+    half of the solve pair); runner=False keeps only what the importable
+    setup file's model body needs (no time/json/argparse/MPI)."""
+    kinds_present = {b["kind"] for b in mphys_builders}
+    types_present = [s["type"] for s in mphys_scenarios]
+    geo = mphys_geometry
+    L = ["import os"]
+    if runner:
+        L += ["import time", "import json", "import argparse"]
+    L.append("import numpy as np")
+    if runner:
+        L.append("from mpi4py import MPI")
+    L += ["import openmdao.api as om", "from mphys.multipoint import Multipoint"]
+    if "dafoam" in kinds_present:
+        L.append("from dafoam.mphys import DAFoamBuilder, OptFuncs")
+    if "tacs" in kinds_present:
+        L.append("from tacs.mphys import TacsBuilder")
+    if "meld" in kinds_present:
+        L.append("from funtofem.mphys import MeldBuilder")
+    for t in dict.fromkeys(types_present):
+        cls, mod, _ = _MPHYS_SCENARIO_TYPES[t]
+        L.append(f"from {mod} import {cls}")
+    if geo is not None:
+        L.append("from pygeo.mphys import OM_DVGEOCOMP")
+        if geo.get("local_dvs"):
+            L.append("from pygeo import geo_utils")
+    for mod in _callable_modules():
+        L.append(f"import {mod}")
+    return L
+
+
+def _mphys_model_segments():
+    """The shared MPhys codegen segments — ONE source of truth for the model
+    body, assembled by both _generate_mphys_script (the monolithic runscript)
+    and _generate_mphys_pair (the {stem}_setup.py / {stem}_compute.py pair), so
+    the exports can never drift. Returns a dict:
+      body     — builder option dict literals + the Top(Multipoint) class
+      driver   — prob.driver configuration lines (empty when not optimizing)
+      fn_names — recorded function names (objective + constraints + masses)
+      dv_names — recorded design-variable names
+      da_lit   — the daOptions literal name (the OptFuncs/trim handle)
+    Array sizes that only exist once the builders load in the container
+    (ndv_struct, nRefAxPts, nShapes) stay symbolic in the emitted code."""
+    require_problem()
+    if not mphys_builders:
+        raise ValueError("No MPhys builders recorded — call add_builder first.")
+    if not mphys_scenarios:
+        raise ValueError("No MPhys scenario recorded — call add_mphys_scenario first.")
+
+    types_present = [s["type"] for s in mphys_scenarios]
+    scen0 = mphys_scenarios[0]
+    geo = mphys_geometry
+
+    # Options literal names per builder (stock names when unambiguous).
+    n_dafoam = sum(1 for b in mphys_builders if b["kind"] == "dafoam")
+    n_tacs = sum(1 for b in mphys_builders if b["kind"] == "tacs")
+    opt_names = {}
+    for b in mphys_builders:
+        sfx = f"_{b['name']}" if (b["kind"] == "dafoam" and n_dafoam > 1) or \
+                                 (b["kind"] == "tacs" and n_tacs > 1) else ""
+        if b["kind"] == "dafoam":
+            opt_names[b["name"]] = (f"daOptions{sfx}", f"meshOptions{sfx}")
+        elif b["kind"] == "tacs":
+            opt_names[b["name"]] = (f"tacsOptions{sfx}",)
+
+    L = []
+
+    # Builder option dict literals. Callback references are woven in as raw
+    # code (tacsSetup.element_callback), never inlined as source strings.
+    for b in mphys_builders:
+        if b["kind"] == "dafoam":
+            da_name, mesh_name = opt_names[b["name"]]
+            _emit_literal(L, da_name, _raw_tokens(b["options"]["daOptions"]))
+            L.append("")
+            _emit_literal(L, mesh_name, _raw_tokens(b["options"]["meshOptions"]))
+            L.append("")
+        elif b["kind"] == "tacs":
+            merged = {}
+            for arg, ref in (b.get("callables") or {}).items():
+                stem = os.path.splitext(os.path.basename(ref["file"]))[0]
+                merged[arg] = _Raw(f"{stem}.{ref['name']}")
+            merged.update(_raw_tokens(b["options"]))
+            _emit_literal(L, opt_names[b["name"]][0], merged)
+            L.append("")
+
+    # ------------------------------------------------------------- setup()
+    L += ["", "class Top(Multipoint):", "    def setup(self):"]
+    mesh_of = {}          # builder name -> its mesh subsystem name
+    for b in mphys_builders:
+        name = b["name"]
+        if b["kind"] == "dafoam":
+            # The scenario kwarg is the type of the scenario this builder joins.
+            b_type = next((s["type"] for s in mphys_scenarios
+                           if name in s["builders"]), types_present[0])
+            da_name, mesh_name = opt_names[name]
+            L.append(f"        {name} = DAFoamBuilder({da_name}, {mesh_name}, "
+                     f"scenario={b_type!r})")
+            L.append(f"        {name}.initialize(self.comm)")
+            mesh = _MPHYS_SCENARIO_TYPES[b_type][2]["dafoam"]
+            mesh_of[name] = mesh
+            L.append(f'        self.add_subsystem("{mesh}", '
+                     f"{name}.get_mesh_coordinate_subsystem())")
+        elif b["kind"] == "tacs":
+            L.append(f"        {name} = TacsBuilder({opt_names[name][0]})")
+            L.append(f"        {name}.initialize(self.comm)")
+            b_type = next((s["type"] for s in mphys_scenarios
+                           if name in s["builders"]), types_present[0])
+            mesh = _MPHYS_SCENARIO_TYPES[b_type][2]["tacs"]
+            mesh_of[name] = mesh
+            L.append(f'        self.add_subsystem("{mesh}", '
+                     f"{name}.get_mesh_coordinate_subsystem())")
+    for b in mphys_builders:
+        if b["kind"] == "meld":
+            scen = next((s for s in mphys_scenarios if b["name"] in s["builders"]),
+                        scen0)
+            roles = _builders_by_kind(scen["builders"])
+            kw = _kwargs_src(b["options"])
+            L.append(f"        {b['name']} = MeldBuilder({roles['dafoam']['name']}, "
+                     f"{roles['tacs']['name']}{', ' + kw if kw else ''})")
+            L.append(f"        {b['name']}.initialize(self.comm)")
+    L.append('        dvs = self.add_subsystem("dvs", om.IndepVarComp(), '
+             'promotes=["*"])')
+    if geo is not None:
+        L.append(f'        self.add_subsystem("geometry", '
+                 f'OM_DVGEOCOMP(file={geo["ffd_file"]!r}, type="ffd"))')
+
+    for scen in mphys_scenarios:
+        cls, _, _ = _MPHYS_SCENARIO_TYPES[scen["type"]]
+        roles = _builders_by_kind(scen["builders"])
+        solver_args = ""
+        for label, key in (("nonlinear_solver", "nl_solver"),
+                           ("linear_solver", "ln_solver")):
+            spec = scen.get(key)
+            if spec:
+                kind = spec["kind"]
+                opts = {k: v for k, v in spec.items() if k != "kind"}
+                L.append(f"        {label} = om.{kind}({_kwargs_src(opts)})")
+                solver_args += f", {label}"
+        role_kw = [f"aero_builder={roles['dafoam']['name']}"]
+        if "tacs" in roles:
+            role_kw.append(f"struct_builder={roles['tacs']['name']}")
+        if "meld" in roles:
+            role_kw.append(f"ldxfer_builder={roles['meld']['name']}")
+        L.append(f"        self.mphys_add_scenario(")
+        L.append(f"            {scen['name']!r},")
+        L.append(f"            {cls}({', '.join(role_kw)}){solver_args})")
+
+        # Structural connects implied by the scenario/geometry structure.
+        aero_mesh = mesh_of[roles["dafoam"]["name"]]
+        if geo is not None:
+            if scen["type"] == "aerostructural":
+                L.append(f'        self.connect("geometry.x_aero0", '
+                         f'"{scen["name"]}.x_aero0")')
+                L.append(f'        self.connect("geometry.x_struct0", '
+                         f'"{scen["name"]}.x_struct0")')
+            else:
+                L.append(f'        self.connect("geometry.x_aero0", '
+                         f'"{scen["name"]}.x_aero")')
+        else:
+            L.append(f'        self.connect("{aero_mesh}.x_aero0", '
+                     f'"{scen["name"]}.x_aero0")')
+        if "tacs" in roles:
+            tacs_name = roles["tacs"]["name"]
+            fill = initial_values.get("dv_struct", 0.01)
+            L.append(f"        ndv_struct = {tacs_name}.get_ndv()")
+            L.append(f"        dvs.add_output(\"dv_struct\", "
+                     f"np.array(ndv_struct * [{fill!r}]))")
+            L.append(f'        self.connect("dv_struct", "{scen["name"]}.dv_struct")')
+    if geo is not None:
+        seen_mesh = set()
+        for b in mphys_builders:
+            mesh = mesh_of.get(b["name"])
+            if mesh is None or mesh in seen_mesh:
+                continue
+            seen_mesh.add(mesh)
+            disc = "aero" if b["kind"] == "dafoam" else "struct"
+            L.append(f'        self.connect("{mesh}.x_{disc}0", '
+                     f'"geometry.x_{disc}_in")')
+    for src, tgt in connections:
+        L.append(f"        self.connect({src!r}, {tgt!r})")
+
+    # --------------------------------------------------------- configure()
+    L += ["", "    def configure(self):", "        super().configure()"]
+    geo_dv_names = []
+    aero_mesh = mesh_of[next(b["name"] for b in mphys_builders
+                             if b["kind"] == "dafoam")]
+    if geo is not None:
+        pointsets = geo.get("pointsets")
+        if pointsets is None:
+            pointsets = ["aero", "struct"] if scen0["type"] == "aerostructural" \
+                else ["aero"]
+        L.append(f"        points = self.{aero_mesh}.mphys_get_surface_mesh()")
+        for ps in pointsets:
+            arg = ', points' if ps == "aero" else ""
+            L.append(f'        self.geometry.nom_add_discipline_coords('
+                     f'"{ps}"{arg})')
+        if geo.get("constraint_surface", True):
+            L.append(f"        tri_points = self.{aero_mesh}."
+                     f"mphys_get_triangulated_surface()")
+            L.append("        self.geometry.nom_setConstraintSurface(tri_points)")
+        ref_axis = geo.get("ref_axis")
+        if ref_axis:
+            L.append(f"        nRefAxPts = self.geometry.nom_addRefAxis("
+                     f"{_kwargs_src(ref_axis)})")
+        for gdv in geo.get("global_dvs") or []:
+            dv = gdv["name"]
+            geo_dv_names.append(dv)
+            start = 1 if gdv.get("skip_root", True) else 0
+            sign = "-" if gdv.get("sign", -1) < 0 else ""
+            idx = f"val[i - {start}]" if start else "val[i]"
+            size = f"nRefAxPts - {start}" if start else "nRefAxPts"
+            L.append(f"        def {dv}(val, geo):")
+            L.append(f"            for i in range({start}, nRefAxPts):")
+            L.append(f'                geo.rot_z[{gdv["axis"]!r}].coef[i] = {sign}{idx}')
+            L.append(f"        self.geometry.nom_addGlobalDV(dvName={dv!r}, "
+                     f"value=np.array([0] * ({size})), func={dv})")
+        for ldv in geo.get("local_dvs") or []:
+            dv = ldv["name"]
+            geo_dv_names.append(dv)
+            nvar = f"n{dv.capitalize()}s"
+            L.append("        pts = self.geometry.DVGeo.getLocalIndex(0)")
+            L.append("        indexList = pts[:, :, :].flatten()")
+            L.append('        PS = geo_utils.PointSelect("list", indexList)')
+            L.append(f"        {nvar} = self.geometry.nom_addLocalDV("
+                     f"dvName={dv!r}, pointSelect=PS)")
+        for gc in geo.get("constraints") or []:
+            kind = gc["kind"]
+            if kind in ("thickness", "volume"):
+                fn = ("nom_addThicknessConstraints2D" if kind == "thickness"
+                      else "nom_addVolumeConstraint")
+                L.append(f"        self.geometry.{fn}({gc['name']!r}, "
+                         f"{gc['leList']!r}, {gc['teList']!r}, "
+                         f"nSpan={gc['nSpan']!r}, nChord={gc['nChord']!r})")
+            else:
+                L.append(f"        self.geometry.nom_add_LETEConstraint("
+                         f"{gc['name']!r}, volID={gc['volID']!r}, "
+                         f"faceID={gc['faceID']!r})")
+
+    # dvs outputs + their connects. Geometry DVs are runtime-sized (symbolic);
+    # any other bare-named design var is a scenario input (e.g. patchV) seeded
+    # from its recorded initial value and connected to the first scenario.
+    dv_names = [dv["name"] for dv in design_vars]
+    for gdv in (geo.get("global_dvs") or []) if geo else []:
+        start = 1 if gdv.get("skip_root", True) else 0
+        size = f"nRefAxPts - {start}" if start else "nRefAxPts"
+        L.append(f"        self.dvs.add_output({gdv['name']!r}, "
+                 f"val=np.array([0] * ({size})))")
+    for ldv in (geo.get("local_dvs") or []) if geo else []:
+        nvar = f"n{ldv['name'].capitalize()}s"
+        L.append(f"        self.dvs.add_output({ldv['name']!r}, "
+                 f"val=np.array([0] * {nvar}))")
+    scenario_inputs = [n for n in dv_names
+                       if "." not in n and n not in geo_dv_names]
+    for n in scenario_inputs:
+        if n not in initial_values:
+            raise ValueError(
+                f"Design variable '{n}' is not a geometry DV, so it needs a "
+                f"recorded starting value (set_initial_value('{n}', [...])) to "
+                f"size its dvs output.")
+        L.append(f"        self.dvs.add_output({n!r}, "
+                 f"val=np.array({initial_values[n]!r}))")
+    for n in geo_dv_names:
+        L.append(f'        self.connect("{n}", "geometry.{n}")')
+    for n in scenario_inputs:
+        L.append(f'        self.connect("{n}", "{scen0["name"]}.{n}")')
+
+    for dv in design_vars:
+        kw = "".join(f", {k}={dv[k]!r}" for k in ("lower", "upper", "scaler")
+                     if dv.get(k) is not None)
+        L.append(f"        self.add_design_var({dv['name']!r}{kw})")
+    if objective is not None:
+        kw = f", scaler={objective_scaler!r}" if objective_scaler is not None else ""
+        L.append(f"        self.add_objective({objective!r}{kw})")
+    for c in constraints:
+        kw = "".join(f", {k}={c[k]!r}" for k in ("lower", "upper", "equals", "scaler")
+                     if c.get(k) is not None)
+        if c.get("linear"):
+            kw += ", linear=True"
+        L.append(f"        self.add_constraint({c['name']!r}{kw})")
+
+    # ------------------------------------------------------------ driver
+    D = []
+    cfg = driver_cfg
+    if objective is not None and design_vars:
+        if cfg is None or cfg["family"] == "pyoptsparse":
+            optimizer = (cfg or {}).get("optimizer", "SLSQP")
+            settings = (cfg or {}).get("opt_settings") or \
+                _PYOPTSPARSE_DEFAULTS.get(optimizer, {})
+            D += ["prob.driver = om.pyOptSparseDriver()",
+                  f'prob.driver.options["optimizer"] = {optimizer!r}']
+            _emit_literal(D, "prob.driver.opt_settings", settings)
+            dbg = (cfg or {}).get("debug_print", ["nl_cons", "objs", "desvars"])
+            if dbg:
+                D.append(f'prob.driver.options["debug_print"] = {dbg!r}')
+            if (cfg or {}).get("print_opt_prob", True):
+                D.append('prob.driver.options["print_opt_prob"] = True')
+            hist = (cfg or {}).get("hist_file", "OptView.hst")
+            if hist:
+                D.append(f"prob.driver.hist_file = {hist!r}")
+        else:
+            D += ["prob.driver = om.ScipyOptimizeDriver()",
+                  f'prob.driver.options["optimizer"] = {cfg["optimizer"]!r}']
+        D.append("")
+
+    # Recorded names for the results tail / function printouts.
+    fn_names = []
+    if objective is not None:
+        fn_names.append(objective)
+    fn_names += [c["name"] for c in constraints]
+    for scen in mphys_scenarios:
+        if "tacs" in _builders_by_kind(scen["builders"]):
+            fn_names.append(f"{scen['name']}.mass")
+    fn_names = list(dict.fromkeys(fn_names))
+    da_lit = next((opt_names[b["name"]][0] for b in mphys_builders
+                   if b["kind"] == "dafoam"), "daOptions")
+    return {"body": L, "driver": D, "fn_names": fn_names,
+            "dv_names": dv_names, "da_lit": da_lit}
+
+def _mphys_task_tail_lines(trim, fn_names, dv_names, da_lit):
+    """The -task switch + results.json tail, emitted VERBATIM into both the
+    monolithic runscript and the compute half of the solve pair (so the two
+    can never diverge). The emitted lines expect `prob`, `args` and
+    time/json/np/MPI already in scope; the curated trim step appears ONLY
+    inside the run_driver branch."""
+    L = []
+    L += [f"_function_names = {fn_names!r}",
+          f"_dv_names = {dv_names!r}",
+          "",
+          "def _val(name):",
+          "    v = np.asarray(prob.get_val(name)).flatten()",
+          "    return float(v[0]) if v.size == 1 else v.tolist()",
+          "",
+          "def _key(k):",
+          '    return k if isinstance(k, str) else ",".join(k)',
+          "",
+          "_t0 = time.time()",
+          '_results = {"status": "success", "task": args.task, "functions": {},',
+          '            "design_vars": {}, "totals": {}, "iterations": 0,',
+          '            "wall_time_sec": 0.0, "error": None}',
+          "try:",
+          '    if args.task == "run_driver":']
+    if trim is not None:
+        comp = ("" if trim["component"] is None
+                else f", designVarsComp=[{trim['component']!r}]")
+        L += [f"        optFuncs = OptFuncs({da_lit}, prob)",
+              f"        optFuncs.findFeasibleDesign([{trim['function']!r}], "
+              f"[{trim['design_var']!r}], targets=[{trim['target']!r}]{comp})"]
+    L += ["        prob.run_driver()",
+          '        _results["iterations"] = int(getattr(prob.driver, "iter_count", 0))',
+          '    elif args.task == "run_model":',
+          "        prob.run_model()",
+          '    elif args.task == "compute_totals":',
+          "        prob.run_model()",
+          "        for _k, _v in prob.compute_totals().items():",
+          '            _results["totals"][_key(_k)] = np.asarray(_v).tolist()',
+          '    elif args.task == "check_totals":',
+          "        prob.run_model()",
+          "        _data = prob.check_totals(compact_print=True, step=1e-3, "
+          'form="central", step_calc="abs")',
+          "        for _k, _cell in _data.items():",
+          '            _results["totals"][_key(_k)] = {',
+          '                "J_fwd": np.asarray(_cell["J_fwd"]).tolist(),',
+          '                "J_fd": np.asarray(_cell["J_fd"]).tolist()}',
+          "    else:",
+          '        raise ValueError(f"unknown task {args.task}")',
+          "    for _name in _function_names:",
+          "        try:",
+          '            _results["functions"][_name] = _val(_name)',
+          "        except Exception:",
+          "            pass",
+          "    for _name in _dv_names:",
+          "        try:",
+          '            _results["design_vars"][_name] = '
+          "np.asarray(prob.get_val(_name)).flatten().tolist()",
+          "        except Exception:",
+          "            pass",
+          "except Exception as _e:",
+          '    _results["status"] = "failed"',
+          '    _results["error"] = str(_e)',
+          '_results["wall_time_sec"] = round(time.time() - _t0, 3)',
+          "if MPI.COMM_WORLD.rank == 0:",
+          '    with open("results.json", "w") as _f:',
+          "        json.dump(_results, _f, indent=2)"]
+    return L
+
+
+def _generate_mphys_script(task_default="run_model", trim=None):
+    """Emit the standalone MPhys runscript: a Top(Multipoint) with setup() and
+    configure() reproducing the recorded builders/scenarios/geometry, the
+    recorded driver / design vars / constraints, a -task switch, and a
+    results.json tail. Assembled from _mphys_model_segments — the SAME segments
+    the solve pair uses. Shared by export_script and run_job — the single
+    generator."""
+    seg = _mphys_model_segments()
+    trim = _normalize_trim(trim)
+    L = _mphys_import_lines(runner=True)
+    L += ["",
+          "parser = argparse.ArgumentParser()",
+          f'parser.add_argument("-task", type=str, default={task_default!r})',
+          "args = parser.parse_args()", ""]
+    L += seg["body"]
+    L += ["", "",
+          "prob = om.Problem(reports=False)",
+          "prob.model = Top()",
+          'prob.setup(mode="rev")',
+          'om.n2(prob, show_browser=False, outfile="mphys.html")', ""]
+    L += seg["driver"]
+    L += _mphys_task_tail_lines(trim, seg["fn_names"], seg["dv_names"],
+                                seg["da_lit"])
+    return "\n".join(L) + "\n"
+
+
+def _generate_mphys_pair(stem, task_default="run_model", trim=None,
+                         np_ranks=4, case_dir=None):
+    """Emit the two-file MPhys solve pair from the SAME segments the monolithic
+    runscript is assembled from, so the pair reproduces its results exactly.
+
+    {stem}_setup.py   — pure model definition: the builder option dicts, the
+        Top(Multipoint) class, and build_problem(write_n2=False) -> om.Problem
+        (driver attached, setup(mode="rev") called). Importable; executes
+        NOTHING at import time.
+    {stem}_compute.py — dual-mode entry point. Inside the DAFoam container
+        (import dafoam succeeds): build_problem(), the same four -task branches
+        as the monolithic script (trim only inside run_driver), results.json on
+        rank 0, and a printout of the recorded functions. On the host (no
+        dafoam): find the running DAFoam container and translate the baked case
+        directory through its bind mounts — helpers baked VERBATIM from
+        remdo/container.py, the same module run_job uses — then re-invoke this
+        file inside via `docker exec -w <cdir> <container> bash -lc "source
+        <env_sh> && mpirun -np <NP> python {stem}_compute.py -task <task>"`,
+        stream the output, read results.json back host-side, print the
+        reported functions, and exit with the child's return code. The env
+        source is required: the image's login shell does NOT put the DAFoam
+        python on PATH (run_job sources the same script). The host branch
+        needs only the stdlib (os/sys/json/subprocess/argparse).
+
+    np_ranks: MPI ranks baked into the host branch's mpirun call.
+    case_dir: the case directory baked into the compute file — where the host
+        branch translates paths from and reads results.json back. Defaults to
+        the current working directory.
+    Returns (setup_src, compute_src)."""
+    seg = _mphys_model_segments()
+    trim = _normalize_trim(trim)
+    setup_mod = f"{stem}_setup"
+    case_dir = os.path.abspath(os.path.expanduser(case_dir or os.getcwd()))
+
+    # ---------------------------------------------------- {stem}_setup.py
+    S = [f"# Auto-generated MPhys model definition ({setup_mod}.py).",
+         "# Importable and side-effect free — run the paired compute file "
+         f"({stem}_compute.py).",
+         ""]
+    S += _mphys_import_lines(runner=False)
+    S += [""]
+    S += seg["body"]
+    S += ["", "",
+          "def build_problem(write_n2=False):",
+          '    """Construct the recorded om.Problem — driver attached,',
+          '    setup(mode="rev") called, optionally the mphys.html N2 diagram',
+          '    written — WITHOUT running anything."""',
+          "    prob = om.Problem(reports=False)",
+          "    prob.model = Top()",
+          '    prob.setup(mode="rev")',
+          "    if write_n2:",
+          '        om.n2(prob, show_browser=False, outfile="mphys.html")']
+    S += [("    " + line) if line else line for line in seg["driver"]]
+    S += ["    return prob"]
+    setup_src = "\n".join(S) + "\n"
+
+    # -------------------------------------------------- {stem}_compute.py
+    C = [f"# Auto-generated MPhys solve pair — compute half; imports {setup_mod}.py.",
+         "# Dual-mode entry point:",
+         "#   in the DAFoam container (import dafoam succeeds): build the recorded",
+         "#   problem, run the -task, and write results.json on rank 0;",
+         "#   on the host: locate the running DAFoam container, translate the baked",
+         "#   case directory through its bind mounts, and re-invoke this file inside",
+         "#   it via docker exec + mpirun. The host branch is stdlib-only.",
+         "import argparse",
+         "import json",
+         "import os",
+         "import subprocess",
+         "import sys",
+         "",
+         f"NP = {int(np_ranks)}",
+         f"CASE_DIR = {case_dir!r}",
+         f"ENV_SH = {_DAFOAM_ENV_SH!r}",
+         "",
+         "parser = argparse.ArgumentParser()",
+         f'parser.add_argument("-task", type=str, default={task_default!r})',
+         "args = parser.parse_args()",
+         "",
+         "try:",
+         "    import dafoam  # noqa: F401 — importable only inside the DAFoam container",
+         "    _IN_CONTAINER = True",
+         "except ImportError:",
+         "    _IN_CONTAINER = False",
+         "",
+         "",
+         "# ---- host-side container plumbing, baked verbatim from remdo/container.py ----"]
+    for fn in (_remdo_container.docker_available,
+               _remdo_container.container_running,
+               _remdo_container.container_path,
+               _remdo_container.find_dafoam_container):
+        C += [""] + inspect.getsource(fn).rstrip("\n").split("\n")
+    C += ["", "",
+          "def _run_on_host():",
+          "    if not docker_available():",
+          '        sys.exit("Docker is not available — start Docker Desktop (or run"',
+          '                 " this file inside the DAFoam container).")',
+          "    name = find_dafoam_container()",
+          "    if name is None:",
+          '        sys.exit("No running DAFoam container found — start it, or set"',
+          "                 \" DAFOAM_CONTAINER to your container's name.\")",
+          "    cdir = container_path(name, CASE_DIR)",
+          "    if cdir is None:",
+          '        sys.exit("case directory %r is not visible inside container %r"',
+          '                 " (not under any bind mount)." % (CASE_DIR, name))',
+          "    rc = subprocess.call(",
+          '        ["docker", "exec", "-w", cdir, name, "bash", "-lc",',
+          '         "source %s && mpirun -np %d python %s -task %s"',
+          "         % (ENV_SH, NP, os.path.basename(__file__), args.task)])",
+          '    results = os.path.join(CASE_DIR, "results.json")',
+          "    if os.path.isfile(results):",
+          "        with open(results) as f:",
+          "            payload = json.load(f)",
+          "        print()",
+          '        print("results.json (task %s): %s"',
+          '              % (payload.get("task"), payload.get("status")))',
+          '        for fname, fval in (payload.get("functions") or {}).items():',
+          '            print("  %s = %s" % (fname, fval))',
+          '        if payload.get("error"):',
+          '            print("  error:", payload["error"])',
+          "    else:",
+          '        print("no results.json found in", CASE_DIR)',
+          "    sys.exit(rc)",
+          "",
+          "",
+          "if not _IN_CONTAINER:",
+          "    _run_on_host()",
+          "",
+          "# ---- in-container: build the recorded problem and run the -task ----",
+          "import time",
+          "import numpy as np",
+          "from mpi4py import MPI",
+          f"from {setup_mod} import build_problem"]
+    if trim is not None and any(b["kind"] == "dafoam" for b in mphys_builders):
+        C += [f"from {setup_mod} import {seg['da_lit']}",
+              "from dafoam.mphys import OptFuncs"]
+    C += ["",
+          "prob = build_problem()",
+          ""]
+    C += _mphys_task_tail_lines(trim, seg["fn_names"], seg["dv_names"],
+                                seg["da_lit"])
+    C += ["",
+          "if MPI.COMM_WORLD.rank == 0:",
+          "    print()",
+          '    print("task %s: %s" % (args.task, _results["status"]))',
+          "    for _name in _function_names:",
+          '        if _name in _results["functions"]:',
+          '            print("  %s = %s" % (_name, _results["functions"][_name]))',
+          '    if _results["error"]:',
+          '        print("  error:", _results["error"])']
+    compute_src = "\n".join(C) + "\n"
+    return setup_src, compute_src
+
+
+# The docker helpers live in remdo.container — ONE module shared by run_job
+# and the exported solve-pair compute files (whose host branch bakes the same
+# function sources verbatim), so the server and the emitted scripts can never
+# drift.
+_docker_available = _remdo_container.docker_available
+_container_running = _remdo_container.container_running
+_container_path = _remdo_container.container_path
 
 
 # ===========================================================================
@@ -1863,7 +2907,8 @@ async def create_problem():
     recorded disciplines, groups, connections, objective, design variables,
     constraints, solvers, and initial values.
     """
-    global prob, objective
+    global prob, objective, _last_residual_sweep
+    global mphys_geometry, driver_cfg, objective_scaler
     # reports=False disables OpenMDAO's auto-report system, which otherwise
     # writes a '<name>_out/reports/' directory into the working directory on
     # setup()/run_driver(). That directory is what fails on a read-only cwd, and
@@ -1879,7 +2924,13 @@ async def create_problem():
     initial_values.clear()
     approx_totals_cfg.clear()
     promotions.clear()
+    mphys_builders.clear()
+    mphys_scenarios.clear()
+    mphys_geometry = None
+    driver_cfg = None
+    objective_scaler = None
     objective = None
+    _last_residual_sweep = None
     return "Created a new problem successfully."
 
 
@@ -1977,7 +3028,8 @@ async def define_problem(spec: dict):
         raise ValueError(f"Unknown spec key(s) {sorted(extra)}; "
                          f"allowed {sorted(allowed_keys)}.")
 
-    global prob, objective
+    global prob, objective, _last_residual_sweep
+    global mphys_geometry, driver_cfg, objective_scaler
 
     # Snapshot everything for rollback.
     snap = {
@@ -1991,10 +3043,15 @@ async def define_problem(spec: dict):
         "initial_values": copy.deepcopy(initial_values),
         "approx_totals_cfg": copy.deepcopy(approx_totals_cfg),
         "promotions": copy.deepcopy(promotions),
+        "mphys_builders": copy.deepcopy(mphys_builders),
+        "mphys_scenarios": copy.deepcopy(mphys_scenarios),
+        "mphys_geometry": copy.deepcopy(mphys_geometry),
+        "driver_cfg": copy.deepcopy(driver_cfg),
+        "objective_scaler": objective_scaler,
     }
 
     def _restore():
-        global prob, objective
+        global prob, objective, mphys_geometry, driver_cfg, objective_scaler
         prob = snap["prob"]
         objective = snap["objective"]
         disciplines[:] = snap["disciplines"]
@@ -2006,6 +3063,11 @@ async def define_problem(spec: dict):
         group_solvers.clear(); group_solvers.update(snap["group_solvers"])
         initial_values.clear(); initial_values.update(snap["initial_values"])
         approx_totals_cfg.clear(); approx_totals_cfg.update(snap["approx_totals_cfg"])
+        mphys_builders[:] = snap["mphys_builders"]
+        mphys_scenarios[:] = snap["mphys_scenarios"]
+        mphys_geometry = snap["mphys_geometry"]
+        driver_cfg = snap["driver_cfg"]
+        objective_scaler = snap["objective_scaler"]
 
     try:
         # 0. Stage any attached files first, so script/matlab components below can
@@ -2016,11 +3078,16 @@ async def define_problem(spec: dict):
 
         # 1. Fresh problem.
         prob = om.Problem(reports=False)
-        for lst in (disciplines, connections, design_vars, constraints, promotions):
+        for lst in (disciplines, connections, design_vars, constraints, promotions,
+                    mphys_builders, mphys_scenarios):
             lst.clear()
         for mp in (groups_map, group_solvers, initial_values, approx_totals_cfg):
             mp.clear()
+        mphys_geometry = None
+        driver_cfg = None
+        objective_scaler = None
         objective = None
+        _last_residual_sweep = None
 
         # 2. Disciplines, then components (everything else references them).
         for item in spec.get("disciplines", []):
@@ -2058,10 +3125,11 @@ async def define_problem(spec: dict):
         if spec.get("objective") is not None:
             _validate_var_ref(spec["objective"], "objective")
         for item in spec.get("design_vars", []):
-            _fields(item, {"name", "lower", "upper"}, "design_vars[]")
+            _fields(item, {"name", "lower", "upper", "scaler"}, "design_vars[]")
             _validate_var_ref(item["name"], "design_vars")
         for item in spec.get("constraints", []):
-            _fields(item, {"name", "lower", "upper", "equals"}, "constraints[]")
+            _fields(item, {"name", "lower", "upper", "equals", "scaler", "linear"},
+                    "constraints[]")
             _validate_var_ref(item["name"], "constraints")
         for key in spec.get("initial_values", {}):
             _validate_var_ref(key, "initial_values")
@@ -2127,13 +3195,51 @@ async def define_problem(spec: dict):
             f". Optimizer: {opt}. Verify partials (if any) and call run().")
 
 @mcp.tool()
-async def set_optimizer(optimizer: str = "SLSQP"):
+async def set_optimizer(optimizer: str = "SLSQP", family: str = None,
+                        opt_settings: dict = None, debug_print: list = None,
+                        print_opt_prob: bool = None, hist_file: str = None):
     """
-    Set the SciPy optimizer for the problem. Optional — run() falls back to
-    SLSQP if this is never called. The driver lives on the Problem and survives
-    the model rebuild, so calling this any time before run() works.
+    Set the optimization driver. Optional — run() falls back to SciPy SLSQP if
+    this is never called. Two driver families:
+
+    family='scipy' (default for plain problems): om.ScipyOptimizeDriver with
+      `optimizer` (SLSQP, COBYLA, ...). The extra arguments are ignored.
+    family='pyoptsparse' (default when MPhys state is present): the emitted
+      script uses om.pyOptSparseDriver — the driver for adjoint-based CFD/FEM
+      optimization (only meaningful via export_script / run_job).
+      optimizer:      'SLSQP' | 'IPOPT' | 'SNOPT'.
+      opt_settings:   per-optimizer settings dict passed through verbatim;
+                      omitted -> curated defaults matching the MACH tutorial
+                      (e.g. SLSQP: ACC=1e-6, MAXIT=100, IFILE=opt_SLSQP.txt).
+      debug_print:    driver debug_print list; default ["nl_cons","objs","desvars"].
+      print_opt_prob: default True.
+      hist_file:      pyOptSparse history file; default 'OptView.hst'.
     """
+    global driver_cfg
     require_problem()
+    if family is None:
+        family = "pyoptsparse" if _mphys_active() else "scipy"
+    if family not in ("scipy", "pyoptsparse"):
+        raise ValueError("family must be 'scipy' or 'pyoptsparse'.")
+    if family == "pyoptsparse":
+        if optimizer not in _PYOPTSPARSE_DEFAULTS:
+            raise ValueError(f"pyoptsparse optimizer must be one of "
+                             f"{sorted(_PYOPTSPARSE_DEFAULTS)}.")
+        if opt_settings is not None and not isinstance(opt_settings, dict):
+            raise ValueError("opt_settings must be a dict or null.")
+        driver_cfg = {
+            "family": "pyoptsparse", "optimizer": optimizer,
+            "opt_settings": dict(opt_settings) if opt_settings
+            else dict(_PYOPTSPARSE_DEFAULTS[optimizer]),
+            "debug_print": (["nl_cons", "objs", "desvars"] if debug_print is None
+                            else list(debug_print)),
+            "print_opt_prob": True if print_opt_prob is None else bool(print_opt_prob),
+            "hist_file": "OptView.hst" if hist_file is None else hist_file,
+        }
+        return (f"pyOptSparse driver recorded: {optimizer} "
+                f"({len(driver_cfg['opt_settings'])} setting(s), "
+                f"hist_file={driver_cfg['hist_file']}).")
+    driver_cfg = {"family": "scipy", "optimizer": optimizer}
     prob.driver = om.ScipyOptimizeDriver()
     prob.driver.options["optimizer"] = optimizer
     return f"Optimizer set to {optimizer}."
@@ -2583,6 +3689,14 @@ async def connect_variables(source: str, target: str):
     other forms a cycle; put them in a group and give it a solver.
     """
     require_problem()
+    # MPhys: endpoints may be promoted/scenario paths owned by no recorded
+    # discipline (e.g. 'masscomp.mass' -> 'scenario1.extra'); such a connection
+    # is recorded raw and emitted verbatim into the generated script's setup().
+    known = {d["name"] for d in disciplines}
+    if _mphys_active() and (source.split(".", 1)[0] not in known
+                            or target.split(".", 1)[0] not in known):
+        connections.append((source, target))
+        return f"Connection recorded: {source} -> {target}."
     # source must be an OUTPUT, target an INPUT. Direction is fixed in OpenMDAO
     # (connect goes output -> input); checking here turns a confusing build-time
     # error from reversed or mistyped arguments into a clear, early one.
@@ -2690,33 +3804,42 @@ async def promote_variables(promoted_name: str, variables: list[str]):
 
 
 @mcp.tool()
-async def set_objective(name: str):
+async def set_objective(name: str, scaler: float = None):
     """
     Set the variable to minimize. Call AFTER the discipline that produces it
     exists. Exactly one objective (gradient optimizers are single-objective);
     calling again replaces it.
 
-    name: the output to minimize, as 'discipline.variable' (e.g. 'd1.z').
+    name:   the output to minimize, as 'discipline.variable' (e.g. 'd1.z').
+            For an MPhys problem, the promoted model path
+            (e.g. 'scenario1.aero_post.CD').
+    scaler: optional driver scaling factor for the objective.
     """
-    global objective
+    global objective, objective_scaler
     require_problem()
-    sub = name.split(".", 1)[0]
-    if sub not in {d["name"] for d in disciplines}:
-        raise ValueError(f"No discipline named '{sub}'. Add it first.")
+    _check_var_owner(name)
     objective = name
+    objective_scaler = scaler
     return f"Objective set to: {name}"
 
 
 @mcp.tool()
-async def add_design_var(name: str, lower: float = None, upper: float = None):
+async def add_design_var(name: str, lower: float | list = None,
+                         upper: float | list = None, scaler: float = None):
     """
     Declare a design variable — an input the optimizer may vary to minimize the
     objective. You need at least one, or the driver has nothing to perturb. Call
     AFTER the discipline that owns the input exists.
 
-    name:  the input to vary, as 'discipline.variable' (e.g. 'd1.x').
-    lower: minimum allowed value (optional, but set it).
-    upper: maximum allowed value (optional).
+    name:   the input to vary, as 'discipline.variable' (e.g. 'd1.x'). For an
+            MPhys problem, the promoted top-level name ('twist', 'shape',
+            'patchV'); a bare non-geometry name also needs a recorded starting
+            value (set_initial_value) to size its dvs output.
+    lower:  minimum allowed value — a scalar, or a per-element list for an array
+            variable (e.g. patchV lower=[100.0, 0.0]; equal lower/upper on an
+            element freezes it).
+    upper:  maximum allowed value (scalar or per-element list).
+    scaler: optional driver scaling factor (e.g. 0.1).
 
     Bounds default to ±inf if omitted, but SLSQP behaves far better boxed in. A
     design var must be an input that nothing else feeds — don't make the target
@@ -2724,10 +3847,9 @@ async def add_design_var(name: str, lower: float = None, upper: float = None):
     set_initial_value.
     """
     require_problem()
-    sub = name.split(".", 1)[0]
-    if sub not in {d["name"] for d in disciplines}:
-        raise ValueError(f"No discipline named '{sub}'. Add it first.")
-    design_vars.append({"name": name, "lower": lower, "upper": upper})
+    _check_var_owner(name)
+    design_vars.append({"name": name, "lower": lower, "upper": upper,
+                        "scaler": scaler})
     bounds = (f" in [{lower}, {upper}]"
               if (lower is not None or upper is not None) else " (unbounded)")
     return f"Design variable '{name}'{bounds} recorded."
@@ -2752,41 +3874,52 @@ async def set_initial_value(name: str, value: float | list):
     Variables default to a scalar 1.0 if never set. Setting a value on an input
     that is fed by connect_variables has no lasting effect — the connection
     overwrites it when the model is solved.
+
+    For an MPhys problem, use the promoted top-level name: a non-geometry design
+    variable's recorded value becomes its dvs.add_output starting array (e.g.
+    set_initial_value('patchV', [100.0, 4.65])), and 'dv_struct' sets the
+    per-element structural thickness fill (default 0.01).
     """
     require_problem()
-    sub = name.split(".", 1)[0]
-    if sub not in {d["name"] for d in disciplines}:
-        raise ValueError(f"No discipline named '{sub}'. Add it first.")
+    _check_var_owner(name)
     initial_values[name] = value
     return f"Initial value recorded: {name} = {value}"
 
 
 @mcp.tool()
-async def add_constraint(name: str, lower: float = None,
-                         upper: float = None, equals: float = None):
+async def add_constraint(name: str, lower: float | list = None,
+                         upper: float | list = None, equals: float | list = None,
+                         scaler: float = None, linear: bool = False):
     """
     Add a constraint — a computed output kept within bounds during optimization.
     Add as many as you need. Call AFTER the discipline that produces the output.
 
     name: the value to constrain, as 'discipline.variable' (e.g. 'd1.g').
-          Normally an OUTPUT (a computed response), unlike a design var.
+          Normally an OUTPUT (a computed response), unlike a design var. For an
+          MPhys problem, the promoted model path ('scenario1.aero_post.CL',
+          'scenario1.ks_vmfailure', 'geometry.volcon', ...).
 
     Bound it with ONE of:
       - inequality: lower and/or upper  (e.g. upper=0 -> g <= 0)
       - equality:   equals              (e.g. equals=1 -> g == 1)
-    equals is mutually exclusive with lower/upper.
+    equals is mutually exclusive with lower/upper. Bounds may be per-element
+    lists for array-valued constraints.
+
+    scaler: optional driver scaling factor.
+    linear: mark the constraint LINEAR in the design variables (e.g. the FFD
+            LE/TE constraints) so the optimizer evaluates its Jacobian once.
     """
     require_problem()
-    sub = name.split(".", 1)[0]
-    if sub not in {d["name"] for d in disciplines}:
-        raise ValueError(f"No discipline named '{sub}'. Add it first.")
+    _check_var_owner(name)
     if lower is None and upper is None and equals is None:
         raise ValueError("A constraint needs a bound: pass lower, upper, or equals.")
     if equals is not None and (lower is not None or upper is not None):
         raise ValueError("equals is mutually exclusive with lower/upper.")
-    constraints.append({"name": name, "lower": lower, "upper": upper, "equals": equals})
+    constraints.append({"name": name, "lower": lower, "upper": upper,
+                        "equals": equals, "scaler": scaler,
+                        "linear": bool(linear)})
     desc = f" == {equals}" if equals is not None else f" in [{lower}, {upper}]"
-    return f"Constraint '{name}'{desc} recorded."
+    return f"Constraint '{name}'{desc}{' (linear)' if linear else ''} recorded."
 
 @mcp.tool()
 def set_approx_totals(method: str = "cs", scope: str = "model", step: float = None) -> str:
@@ -2807,6 +3940,11 @@ def set_approx_totals(method: str = "cs", scope: str = "model", step: float = No
             totals everywhere else).
     step:   optional FD/CS step size; OpenMDAO's default is used if omitted.
     """
+    _require_no_mphys(
+        "set_approx_totals (complex-step is impossible through compiled CFD, and "
+        "FD approx-totals costs a full MDA per perturbation per design variable)",
+        "the adjoint totals the generated script already computes via "
+        "prob.setup(mode='rev') and the builders")
     approx_totals_cfg.clear()
     approx_totals_cfg.update({"method": method, "scope": scope, "step": step})
     return f"Total derivatives will be approximated via {method} on '{scope}'."
@@ -2823,8 +3961,23 @@ async def show_n2_diagram(outfile: str = "n2.html"):
 
     outfile: file name for the diagram. Only the base name is used; the file is
              always written into ~/Downloads regardless of any directory parts.
+
+    For an MPhys problem the N2 cannot be built in-process (the subsystems only
+    exist inside the DAFoam container); the generated script writes it as
+    mphys.html in the run workdir instead — the path of the latest finished
+    job's copy is returned when one exists.
     """
     require_problem()
+    if _mphys_active():
+        for job in reversed(list(_mphys_jobs.values())):
+            p = os.path.join(job["workdir"], "mphys.html")
+            if os.path.isfile(p):
+                return f"MPhys N2 diagram (written by the generated script): **{p}**"
+        return ("An MPhys model's N2 is built inside the DAFoam container, not "
+                "in-process: the generated script writes it as mphys.html in the "
+                "run workdir (om.n2 runs right after prob.setup). Start a job "
+                "with run_job — even a failed run usually leaves mphys.html — "
+                "then call this again or open <workdir>/mphys.html.")
     downloads = os.path.join(os.path.expanduser("~"), "Downloads")
     os.makedirs(downloads, exist_ok=True)
     out_path = os.path.join(downloads, os.path.basename(outfile))
@@ -2838,7 +3991,9 @@ async def show_n2_diagram(outfile: str = "n2.html"):
 @mcp.tool()
 async def export_script(outfile: str = "openmdao_model.py", mode: str = "solve",
                         decompose: str = "leaf", return_map: bool = False,
-                        include_outputs: list = None):
+                        include_outputs: list = None, main_sweep: dict = None,
+                        task: str = "run_model", trim: dict = None,
+                        output_dir: str = None, np: int = 4):
     """
     Export the current problem as a standalone, runnable Python script that
     rebuilds it with the OpenMDAO API directly — no MCP server needed. The script
@@ -2850,6 +4005,34 @@ async def export_script(outfile: str = "openmdao_model.py", mode: str = "solve",
 
     outfile: file name for the script. Only the base name is used; it is always
              written into ~/Downloads regardless of any directory parts.
+
+    MPHYS PROBLEMS (builders/scenarios recorded): mode="solve" emits the
+    Top(Multipoint) runscript instead — the same script run_job executes. It
+    needs the compiled DAFoam/TACS/MELD stack, so run it in the case directory
+    inside the DAFoam container (mpirun -np N python <script> -task <task>).
+    Referenced callback files (e.g. tacsSetup.py) are staged next to it.
+      task: default for the emitted -task switch ('run_model' | 'run_driver' |
+            'compute_totals' | 'check_totals'; all four branches are always
+            emitted).
+      trim: optional curated trim step emitted only inside the run_driver
+            branch: {"function": "scenario1.aero_post.CL", "design_var":
+            "patchV", "target": 0.5, "component": 1} -> DAFoam's
+            OptFuncs.findFeasibleDesign before prob.run_driver().
+      output_dir: directory for the script + staged files; default ~/Downloads
+            (write straight into the case directory to make it bare-runnable).
+    mode="solve_pair" (MPhys ONLY) emits a TWO-FILE pair instead of the
+    monolithic runscript: {stem}_setup.py (importable model definition —
+    builder option dicts, the Top class, build_problem(); executes NOTHING at
+    import) and {stem}_compute.py (press-runnable entry point: inside the
+    container it runs the -task and writes results.json; on the host it
+    docker-execs itself into the running DAFoam container with mpirun and
+    prints the reported functions — stdlib only, no remdo needed). {stem} is
+    outfile without its extension. Extra parameter:
+      np: MPI ranks baked into the compute file's host-side mpirun (default 4).
+    With no output_dir the pair goes to the case directory of the last run_job
+    when one is recorded (else ~/Downloads, with a warning — the pair is only
+    bare-runnable from the case directory).
+    The residual modes are refused for MPhys problems.
 
     mode: what the exported script does (default "solve", the original behavior).
       "solve"    — rebuild the COUPLED problem and either optimize (if an objective
@@ -2872,8 +4055,11 @@ async def export_script(outfile: str = "openmdao_model.py", mode: str = "solve",
                    file {name}_residual_sweep.py. It defines the same single-point
                    residuals() kernel and adds residuals_batch(samples) (the offline
                    twin of evaluate_residual's samples=) and residuals_sweep(sweeps,
-                   fixed_inputs) (the twin of evaluate_residuals_batch), with a
-                   __main__ that runs an illustrative sweep. The single-point
+                   fixed_inputs) (the twin of evaluate_residuals_batch). Its __main__
+                   runs the sweep given in main_sweep — or, when that is omitted, the
+                   most recent evaluate_residuals_batch / evaluate_residual(samples=...)
+                   run — and prints a residual table; with neither it falls back to a
+                   coupling-guess demo that exits 0. The single-point
                    {name}_residual_compute.py is NOT written in this mode.
 
     The remaining arguments apply to mode="residual"/"residual_sweep" only and
@@ -2887,16 +4073,107 @@ async def export_script(outfile: str = "openmdao_model.py", mode: str = "solve",
     include_outputs: optional ['discipline.variable', ...] of dangling/system
                outputs to ALSO expose as residual targets, exactly as
                evaluate_residual's include_outputs does. (Ignored in mode="solve".)
+    main_sweep: optional (mode="residual_sweep" only) sweep to bake into the emitted
+               file's __main__ so a bare `python {name}_residual_sweep.py` reproduces a
+               real DESIGN sweep, not just an illustrative coupling-guess demo:
+               {"variable": 'disc.var', "start": float, "stop": float,
+                "increment": float (optional, default 0.1),
+                "fixed_inputs": {'disc.var': value} (optional)}. It is baked as the
+               module constants MAIN_SWEEP / MAIN_FIXED_INPUTS and __main__ prints a
+               table of each coupling residual and ||r||2 per swept value plus the
+               stacked norm. When omitted, the sweep defaults to the most recent
+               evaluate_residuals_batch / evaluate_residual(samples=...) run; when
+               nothing has been run either, the file falls back to the legacy
+               coupling-guess demo (which exits 0). Also feeds the in-effect coupling
+               guesses into the baked RECORDED_STATE so residuals() runs with no args.
     """
     require_problem()
-    if mode not in ("solve", "residual", "residual_sweep"):
+    if mode not in ("solve", "solve_pair", "residual", "residual_sweep"):
         raise ValueError("mode must be 'solve' (default; rebuild and solve the "
-                         "coupled problem), 'residual' (emit the decoupled "
-                         "residuals(u) offline twin of evaluate_residual), or "
-                         "'residual_sweep' (the same setup plus a batch/sweep "
-                         "compute file).")
-    downloads = os.path.join(os.path.expanduser("~"), "Downloads")
+                         "coupled problem), 'solve_pair' (MPhys only: the "
+                         "two-file setup/compute container pair), 'residual' "
+                         "(emit the decoupled residuals(u) offline twin of "
+                         "evaluate_residual), or 'residual_sweep' (the same "
+                         "setup plus a batch/sweep compute file).")
+    downloads = (os.path.abspath(os.path.expanduser(output_dir)) if output_dir
+                 else os.path.join(os.path.expanduser("~"), "Downloads"))
     os.makedirs(downloads, exist_ok=True)
+
+    if mode == "solve_pair":
+        if not _mphys_active():
+            raise ValueError(
+                "mode='solve_pair' emits the MPhys container solve pair, but "
+                "no MPhys builders/scenarios are recorded on this problem. "
+                "For a plain OpenMDAO problem use mode='residual' (the "
+                "importable residual setup/compute pair) or mode='solve'.")
+        stem = os.path.splitext(os.path.basename(outfile))[0]
+        warn = ""
+        if output_dir:
+            out_dir = downloads
+        else:
+            # Bare-runnable default: the case directory of the last run_job.
+            last_wd = next((j["workdir"] for j in
+                            reversed(list(_mphys_jobs.values()))), None)
+            if last_wd and os.path.isdir(last_wd):
+                out_dir = last_wd
+            else:
+                out_dir = downloads
+                warn = ("\nWARNING: no case directory recorded from a "
+                        "previous run_job, so the pair went to ~/Downloads. "
+                        "It is only bare-runnable from the case directory — "
+                        "move both files (plus staged callbacks) there, or "
+                        "re-export with output_dir=<case dir>.")
+        setup_src, compute_src = _generate_mphys_pair(
+            stem, task_default=task, trim=trim, np_ranks=np, case_dir=out_dir)
+        setup_path = os.path.join(out_dir, f"{stem}_setup.py")
+        compute_path = os.path.join(out_dir, f"{stem}_compute.py")
+        with open(setup_path, "w") as f:
+            f.write(setup_src)
+        with open(compute_path, "w") as f:
+            f.write(compute_src)
+        staged, missing = _stage_mphys_files(out_dir)
+        notes = ""
+        if staged:
+            notes += "\nStaged next to it: " + ", ".join(f"**{p}**" for p in staged)
+        if missing:
+            notes += ("\nNOT found to stage (place them beside the script "
+                      "yourself): " + ", ".join(missing))
+        return (
+            "MPhys solve pair written to:\n"
+            f"- setup (model definition, importable): **{setup_path}**\n"
+            f"- compute (entry point): **{compute_path}**"
+            f"{notes}{warn}\n\n"
+            f"Press-run **{stem}_compute.py** on the host (no arguments "
+            "needed): it finds the running DAFoam container, docker-execs "
+            f"itself inside with mpirun -np {int(np)}, streams the output, "
+            "and prints the reported functions. Inside the container: "
+            f"`mpirun -np {int(np)} python {stem}_compute.py -task {task}`."
+            "\n\n"
+            f"```python\n# === {os.path.basename(setup_path)} ===\n"
+            + setup_src + "```\n\n"
+            f"```python\n# === {os.path.basename(compute_path)} ===\n"
+            + compute_src + "```")
+
+    if _mphys_active():
+        if mode != "solve":
+            _require_no_mphys(
+                f"export_script(mode={mode!r}) (the residual export assumes cheap "
+                "in-process units)", "mode='solve' — the MPhys runscript")
+        source = _generate_mphys_script(task_default=task, trim=trim)
+        out_path = os.path.join(downloads, os.path.basename(outfile))
+        with open(out_path, "w") as f:
+            f.write(source)
+        staged, missing = _stage_mphys_files(downloads)
+        notes = ""
+        if staged:
+            notes += "\nStaged next to it: " + ", ".join(f"**{p}**" for p in staged)
+        if missing:
+            notes += ("\nNOT found to stage (place them beside the script "
+                      "yourself): " + ", ".join(missing))
+        return (f"Standalone MPhys runscript written to: **{out_path}**{notes}\n\n"
+                f"Run it in the case directory inside the DAFoam container:\n"
+                f"`mpirun -np 4 python {os.path.basename(outfile)} -task {task}`\n\n"
+                "```python\n" + source + "```")
 
     if mode in ("residual", "residual_sweep"):
         # The residual export is split across two files so the structural boilerplate
@@ -2909,9 +4186,30 @@ async def export_script(outfile: str = "openmdao_model.py", mode: str = "solve",
         sweep = (mode == "residual_sweep")
         problem_name = os.path.splitext(os.path.basename(outfile))[0]
         setup_module = f"{problem_name}_residual_setup"
+
+        # Resolve the design sweep baked into the sweep file's __main__ (Change B/C) and
+        # the in-effect coupling guesses folded into RECORDED_STATE (Change A): an
+        # explicit main_sweep wins, else the most recent batched residual evaluation.
+        resolved_sweep = None
+        resolved_fixed = {}
+        if main_sweep is not None:
+            if not isinstance(main_sweep, dict):
+                raise ValueError("main_sweep must be an object with 'variable', "
+                                 "'start', 'stop', optional 'increment' and "
+                                 "optional 'fixed_inputs'.")
+            resolved_fixed = dict(main_sweep.get("fixed_inputs") or {})
+            if sweep:
+                resolved_sweep = _normalize_sweep_spec(main_sweep)
+        elif _last_residual_sweep is not None:
+            remembered_sweep, resolved_fixed = _resolve_remembered_sweep(
+                _last_residual_sweep)
+            if sweep:
+                resolved_sweep = remembered_sweep
+
         setup_src, compute_src = _generate_residual_script(
             decompose=decompose, return_map=return_map,
-            include_outputs=include_outputs, setup_module=setup_module, sweep=sweep)
+            include_outputs=include_outputs, setup_module=setup_module, sweep=sweep,
+            main_sweep=resolved_sweep, main_fixed_inputs=resolved_fixed)
         compute_base = (f"{problem_name}_residual_sweep.py" if sweep
                         else f"{problem_name}_residual_compute.py")
         compute_label = "compute (residuals + sweep)" if sweep else "compute (residuals)"
@@ -2939,6 +4237,123 @@ async def export_script(outfile: str = "openmdao_model.py", mode: str = "solve",
 
 
 @mcp.tool()
+async def evaluate_residuals_from_file(points_file: str, variable_names: list = None,
+                                       output_dir: str = None,
+                                       outfile: str = "openmdao_model.py",
+                                       decompose: str = "leaf",
+                                       return_map: bool = False,
+                                       include_outputs: list = None):
+    """
+    Emit a standalone, runnable script PAIR that evaluates the DECOUPLED
+    consistency residual r(u) at every point in a user-supplied file — the
+    file-driven generalization of evaluate_residuals_batch. Like export_script,
+    this tool only WRITES the scripts; it does NOT run the model itself. The user
+    runs the generated compute file on their own machine, which loads the points
+    file and, for each row (one full or partial point in design-variable space),
+    evaluates residuals() at that point — analogous to calling evaluate_residual
+    once per row, but without one tool call per row.
+
+    The output mirrors export_script(mode='residual'): a setup file holding the
+    SAME structural boilerplate, ScriptComp/support code, baked constants, decoupled
+    model builder and PROB singleton (produced by the identical code path so it can
+    never drift), and a compute file holding residuals() plus the file loader and a
+    __main__ runner. Both go to output_dir and must stay side by side so the import
+    resolves. Show the returned paths to the user in bold.
+
+    points_file: ABSOLUTE path to the points file on disk — .csv, .xlsx, or .npy.
+       This path is baked into the generated compute file's loader (with a comment
+       noting the user can edit it if the file moves). One row = one augmented input
+       u; columns are 'discipline.variable' values.
+    variable_names: optional ['discipline.variable', ...] in column order.
+       - CSV / .xlsx: omitted -> the file's header row is used as the variable names;
+         supplied -> overrides the headers (positional mapping, df.columns =
+         variable_names after load).
+       - .npy: a plain (unstructured) array carries no headers, so variable_names is
+         REQUIRED when points_file ends in .npy — this is enforced here, at generation
+         time. (A structured .npy array carries its own field names; the generated
+         loader uses those and ignores variable_names, but that can only be detected
+         when the file is actually read.)
+    output_dir: optional directory for the two scripts. Defaults to ~/Downloads (the
+       same convention export_script uses).
+    outfile: optional base name whose stem names the script pair, exactly as in
+       export_script (default 'openmdao_model' -> openmdao_model_residual_from_file_
+       setup.py / _compute.py). Only the base name's stem is used.
+
+    decompose / return_map / include_outputs: mirror evaluate_residual /
+    export_script(mode='residual') so the emitted residuals() is a faithful offline
+    twin. decompose='leaf' only (default); 'group' raises NotImplementedError in
+    codegen as elsewhere.
+
+    The generated compute file's __main__ is best-effort: a row naming a variable the
+    model does not have, or a row whose evaluation raises (bounds/domain errors, an
+    unsupplied coupling variable, solver non-convergence), is recorded as an error
+    with its row_index and skipped — the run continues. It prints one line per row as
+    it completes, then a final 'N ok, M error' summary. Results go to stdout only; no
+    CSV/JSON file is written.
+    """
+    require_problem()
+    _require_no_mphys(
+        "evaluate_residuals_from_file (the emitted residuals() assumes cheap "
+        "in-process evaluation — an MPhys residual is a container-side CFD-cost "
+        "operation)",
+        "run_job / export_script for MPhys problems")
+    if not disciplines:
+        raise ValueError("No disciplines recorded — build the model first.")
+    if not isinstance(points_file, str) or not points_file:
+        raise ValueError("points_file must be the absolute path to a .csv, .xlsx, or "
+                         ".npy file.")
+    ext = os.path.splitext(points_file)[1].lower()
+    if ext not in (".csv", ".xlsx", ".npy"):
+        raise ValueError(f"unsupported points_file extension {ext!r}; the points file "
+                         "must be .csv, .xlsx, or .npy.")
+    if variable_names is not None:
+        if (not isinstance(variable_names, (list, tuple))
+                or not all(isinstance(v, str) and v for v in variable_names)):
+            raise ValueError("variable_names must be a list of non-empty "
+                             "'discipline.variable' strings, in column order.")
+        variable_names = list(variable_names)
+    if ext == ".npy" and variable_names is None:
+        raise ValueError("variable_names is required for a .npy points_file: a plain "
+                         ".npy array has no column headers, so the column-to-variable "
+                         "mapping must be given explicitly. (A structured .npy array "
+                         "with named fields uses those instead and ignores "
+                         "variable_names, but that is only detectable when the file is "
+                         "read at run time.)")
+
+    out_dir = (os.path.expanduser(output_dir) if output_dir
+               else os.path.join(os.path.expanduser("~"), "Downloads"))
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Same problem-name derivation as export_script: the stem of outfile. The setup
+    # module is named so the compute file's `from <module> import PROB, ...` resolves
+    # to the co-located setup file.
+    problem_name = os.path.splitext(os.path.basename(outfile))[0]
+    setup_module = f"{problem_name}_residual_from_file_setup"
+    setup_src, compute_src = _generate_residual_script(
+        decompose=decompose, return_map=return_map, include_outputs=include_outputs,
+        setup_module=setup_module,
+        from_file={"points_file": points_file, "variable_names": variable_names})
+
+    setup_path = os.path.join(out_dir, f"{setup_module}.py")
+    compute_path = os.path.join(
+        out_dir, f"{problem_name}_residual_from_file_compute.py")
+    with open(setup_path, "w") as f:
+        f.write(setup_src)
+    with open(compute_path, "w") as f:
+        f.write(compute_src)
+    return (
+        "Standalone residual-from-file scripts written to:\n"
+        f"- setup (boilerplate): **{setup_path}**\n"
+        f"- compute (residuals + file loader): **{compute_path}**\n\n"
+        f"Run `python {os.path.basename(compute_path)}` — both files must stay in the "
+        "same directory so the compute file can import the setup file. It reads "
+        f"`{points_file}` and prints one residual line per row, then an ok/error "
+        "summary.\n\n"
+        f"```python\n# === {os.path.basename(setup_path)} ===\n" + setup_src + "```\n\n"
+        f"```python\n# === {os.path.basename(compute_path)} ===\n" + compute_src + "```")
+
+
+@mcp.tool()
 async def check_partials(name: str = None):
     """
     Verify the analytic partials of full components (added via add_component)
@@ -2954,6 +4369,14 @@ async def check_partials(name: str = None):
     no verification, so they are skipped.
     """
     require_problem()
+    if name is None:
+        # Scoped to one CHEAP recorded component it may proceed (the in-process
+        # build never contains the MPhys subsystems); at full model scope on an
+        # MPhys problem it would imply finite-differencing compiled CFD/FEM.
+        _require_no_mphys(
+            "check_partials at full model scope",
+            "check_partials(name='<component>') for a cheap recorded component, "
+            "or run_job(task='check_totals') for the coupled derivatives")
 
     targets = [d for d in disciplines
                if d.get("kind") == "component" and (name is None or d["name"] == name)]
@@ -3009,6 +4432,9 @@ async def run():
     variables, and any constraints at the solution. Nothing is written to disk.
     """
     require_problem()
+    _require_no_mphys(
+        "run() (synchronous, in-process, no MPI)",
+        "run_job to execute in the DAFoam container, or export_script for the script")
     if objective is None:
         raise ValueError("No objective set — call set_objective first.")
     if not design_vars:
@@ -3154,6 +4580,10 @@ async def evaluate_residual(u: dict = None, decompose: str = "leaf",
     Reads the recorded model only — no module state and no live problem is mutated.
     """
     require_problem()
+    _require_no_mphys(
+        "evaluate_residual (in-process decoupled evaluation — an MPhys residual "
+        "is a container-side CFD-cost operation)",
+        "run_job / export_script for MPhys problems")
     if not disciplines:
         raise ValueError("No disciplines recorded — build the model first.")
 
@@ -3203,6 +4633,13 @@ async def evaluate_residual(u: dict = None, decompose: str = "leaf",
         for k in stacked:
             stacked[k].append(res[k].tolist())
     overall = np.concatenate(all_vals) if all_vals else np.array([])
+    # Remember this batched evaluation so export_script(mode="residual_sweep") can bake
+    # the same point cloud into the emitted file's __main__ when no main_sweep is given.
+    global _last_residual_sweep
+    _last_residual_sweep = {
+        "samples": [dict(s) for s in samples if isinstance(s, dict)],
+        "fixed_inputs": {},
+    }
     return {
         "residuals": stacked,
         "residual_norms": per_sample_norms,
@@ -3256,6 +4693,10 @@ async def evaluate_residuals_batch(sweeps: list, fixed_inputs: dict = None,
     only; no module state and no live problem is mutated.
     """
     require_problem()
+    _require_no_mphys(
+        "evaluate_residuals_batch (in-process decoupled evaluation — an MPhys "
+        "residual is a container-side CFD-cost operation)",
+        "run_job / export_script for MPhys problems")
     if not disciplines:
         raise ValueError("No disciplines recorded — build the model first.")
     if not isinstance(sweeps, (list, tuple)) or not sweeps:
@@ -3306,6 +4747,14 @@ async def evaluate_residuals_batch(sweeps: list, fixed_inputs: dict = None,
                     "inputs": inputs,
                     "error": str(e),
                 })
+    # Remember this sweep so export_script(mode="residual_sweep") can bake it into the
+    # emitted file's __main__ when no explicit main_sweep is passed (Change C).
+    global _last_residual_sweep
+    _last_residual_sweep = {
+        "sweeps": [dict(s) for s in sweeps if isinstance(s, dict)],
+        "fixed_inputs": dict(fixed_inputs),
+        "default_increment": default_increment,
+    }
     return results
 
 
@@ -3342,6 +4791,9 @@ async def evaluate_model(inputs: dict = None, outputs: list = None):
     problem (like run()), so it mutates the module's problem state.
     """
     require_problem()
+    _require_no_mphys(
+        "evaluate_model (synchronous, in-process, no MPI)",
+        "run_job(task='run_model') to solve the coupled MDA in the DAFoam container")
     if not disciplines:
         raise ValueError("No disciplines recorded — build the model first.")
     inputs = inputs or {}
@@ -3389,6 +4841,381 @@ async def evaluate_model(inputs: dict = None, outputs: list = None):
         "outputs": list(read),
         "converged": converged,
     }
+
+
+@mcp.tool()
+async def add_builder(name: str, kind: str, options: dict, callables: dict = None):
+    """
+    Record a named MPhys solver BUILDER — a compiled-solver factory (DAFoam CFD,
+    TACS FEM, MELD load/displacement transfer) that a scenario composes into a
+    coupled analysis. Like every other tool here this only RECORDS intent; the
+    builder is instantiated inside the generated runscript, which runs in the
+    DAFoam Docker container (run_job) or wherever the user runs the exported
+    script. Call AFTER create_problem, once per builder.
+
+    name:    variable name the builder gets in the generated script (e.g.
+             'aero_builder'); refer to it in add_mphys_scenario by this name.
+    kind:    'dafoam' | 'tacs' | 'meld'.
+    options: the builder's config as pure JSON:
+             - dafoam: {"daOptions": {...}, "meshOptions": {...}} (the two dicts
+               from a DAFoam runscript, verbatim).
+             - tacs:   the tacsOptions dict MINUS callbacks (e.g.
+               {"mesh_file": "./wingbox.bdf"}); callbacks go in `callables`.
+             - meld:   constructor kwargs (e.g. {"isym": 2, "check_partials": true});
+               the aero/struct builder arguments are wired automatically from the
+               scenario this builder joins.
+             The exact string "os.getcwd()" as a value (the stock scripts use it
+             for meshOptions['gridFile']) is emitted as the raw call, resolved at
+             run time in the case directory — never baked to a host path.
+    callables: callback references as {"arg_name": {"file": "tacsSetup.py",
+             "name": "element_callback"}}. The generated script imports the file
+             as a module (import tacsSetup) and passes tacsSetup.element_callback;
+             the file itself is staged next to the script — callback source is
+             never inlined. Give "file" as a path relative to the run directory
+             (the case folder) or absolute.
+    """
+    require_problem()
+    if kind not in _MPHYS_BUILDER_KINDS:
+        raise ValueError(f"kind must be one of {_MPHYS_BUILDER_KINDS}.")
+    if not name.isidentifier():
+        raise ValueError(f"name '{name}' is not a valid variable name.")
+    if _find_builder(name) is not None:
+        raise ValueError(f"A builder named '{name}' already exists.")
+    if not isinstance(options, dict):
+        raise ValueError("options must be an object (JSON dict).")
+    if kind == "dafoam":
+        missing = [k for k in ("daOptions", "meshOptions") if k not in options]
+        if missing:
+            raise ValueError(f"dafoam builder options must contain {missing} "
+                             "(the daOptions and meshOptions dicts, verbatim).")
+    if callables is not None:
+        if not isinstance(callables, dict):
+            raise ValueError("callables must be an object mapping argument names "
+                             "to {'file': ..., 'name': ...}.")
+        for arg, ref in callables.items():
+            if not (isinstance(ref, dict) and
+                    isinstance(ref.get("file"), str) and ref["file"] and
+                    isinstance(ref.get("name"), str) and ref["name"].isidentifier()):
+                raise ValueError(
+                    f"callables['{arg}'] must be {{'file': 'module.py', "
+                    f"'name': 'function_name'}}.")
+    mphys_builders.append({"name": name, "kind": kind, "options": options,
+                           "callables": dict(callables) if callables else {}})
+    n_call = len(callables or {})
+    return (f"Builder '{name}' ({kind}) recorded"
+            + (f" with {n_call} callback reference(s)" if n_call else "")
+            + ". Compose it into a scenario with add_mphys_scenario.")
+
+
+@mcp.tool()
+async def add_mphys_scenario(name: str, type: str, builders: list[str],
+                             nl_solver: dict = None, ln_solver: dict = None):
+    """
+    Record an MPhys SCENARIO — one coupled analysis condition composing the
+    recorded builders (e.g. a DAFoam+TACS+MELD aerostructural MDA). Emitted in
+    the generated script as mphys_add_scenario(name, Scenario...(builders...),
+    nl_solver, ln_solver), with each builder's mesh-coordinate subsystem added
+    in setup(). Call AFTER the named builders exist.
+
+    name:     scenario subsystem name (e.g. 'scenario1'). Refer to its outputs
+              elsewhere by promoted path, e.g. 'scenario1.aero_post.CD'.
+    type:     'aerostructural' (needs one dafoam + one tacs + one meld builder)
+              or 'aerodynamic' (one dafoam builder).
+    builders: names of the participating builders, e.g.
+              ["aero_builder", "struct_builder", "xfer_builder"].
+    nl_solver: nonlinear solver spec for the coupled primal, e.g.
+              {"kind": "NonlinearBlockGS", "maxiter": 25, "iprint": 2,
+               "use_aitken": true, "rtol": 1e-8, "atol": 1.0}. Every key but
+              'kind' passes through as a solver option. Optional for
+              'aerodynamic' (a single-solver scenario needs none).
+    ln_solver: linear solver spec for the coupled adjoint, e.g.
+              {"kind": "LinearBlockGS", "maxiter": 25, "iprint": 2,
+               "use_aitken": true, "rtol": 1e-6, "atol": 1e-6}.
+    """
+    require_problem()
+    if type not in _MPHYS_SCENARIO_TYPES:
+        raise ValueError(f"type must be one of {sorted(_MPHYS_SCENARIO_TYPES)}.")
+    if not name.isidentifier():
+        raise ValueError(f"name '{name}' is not a valid subsystem name.")
+    if any(s["name"] == name for s in mphys_scenarios):
+        raise ValueError(f"A scenario named '{name}' already exists.")
+    if not builders:
+        raise ValueError("builders must list at least one recorded builder name.")
+    unknown = [b for b in builders if _find_builder(b) is None]
+    if unknown:
+        raise ValueError(f"Unknown builder(s) {unknown}. Add them with add_builder.")
+    kinds = [_find_builder(b)["kind"] for b in builders]
+    required = {"aerostructural": ["dafoam", "tacs", "meld"],
+                "aerodynamic": ["dafoam"]}[type]
+    missing = [k for k in required if k not in kinds]
+    if missing:
+        raise ValueError(f"A(n) {type} scenario needs builder kind(s) {missing}; "
+                         f"got {kinds}.")
+    for label, spec in (("nl_solver", nl_solver), ("ln_solver", ln_solver)):
+        if spec is not None and not (isinstance(spec, dict) and
+                                     isinstance(spec.get("kind"), str) and
+                                     spec["kind"].isidentifier()):
+            raise ValueError(f"{label} must be an object with a 'kind' (an "
+                             "om solver class name, e.g. 'NonlinearBlockGS').")
+    mphys_scenarios.append({"name": name, "type": type,
+                            "builders": list(builders),
+                            "nl_solver": dict(nl_solver) if nl_solver else None,
+                            "ln_solver": dict(ln_solver) if ln_solver else None})
+    return (f"Scenario '{name}' ({type}) recorded with builders {builders}"
+            + (f", {nl_solver['kind']}/{ln_solver['kind']} solvers"
+               if nl_solver and ln_solver else "") + ".")
+
+
+@mcp.tool()
+async def add_geometry_ffd(ffd_file: str, pointsets: list[str] = None,
+                           ref_axis: dict = None, global_dvs: list = None,
+                           local_dvs: list = None, constraints: list = None,
+                           constraint_surface: bool = True):
+    """
+    Record the FFD geometry parameterization (pyGeo DVGeo/DVCon) for an MPhys
+    problem — the declarative twin of the stock runscript's configure() body.
+    Emitted as an OM_DVGEOCOMP('geometry') subsystem plus the pointset / design
+    variable / geometric-constraint calls. One geometry per problem.
+
+    ffd_file: the FFD file path as the script should see it at RUN time,
+              e.g. 'FFD/wingFFD.xyz' (relative to the case directory).
+    pointsets: disciplines whose mesh coordinates the geometry moves. Default:
+              ['aero', 'struct'] for an aerostructural scenario, ['aero'] for
+              aerodynamic.
+    ref_axis: reference axis for global (e.g. twist) variables:
+              {"name": "wingAxis", "xFraction": 0.25, "alignIndex": "k"}.
+    global_dvs: templated ref-axis rotation DVs, e.g. twist:
+              [{"name": "twist", "axis": "wingAxis", "sign": -1,
+                "skip_root": true}]. Emits the standard rot_z closure over the
+              runtime nRefAxPts (sign -1 = positive DV twists leading-edge up,
+              matching the MACH tutorial; skip_root leaves station 0 fixed).
+              Sized [0]*(nRefAxPts-1) at runtime — never resolved here.
+    local_dvs: local shape DVs over the FFD points, e.g. [{"name": "shape"}]
+              (point-select over the full FFD index, the stock pattern). Sized
+              [0]*nShapes at runtime.
+    constraints: geometric constraints:
+              - {"name": "thickcon", "kind": "thickness", "leList": [...],
+                 "teList": [...], "nSpan": 10, "nChord": 10}
+              - {"name": "volcon", "kind": "volume", ... same fields ...}
+              - {"name": "lecon", "kind": "le_te", "volID": 0, "faceID": "iLow"}
+              Bound them with add_constraint('geometry.<name>', ...).
+    constraint_surface: pass the triangulated aero surface to DVCon (needed by
+              thickness/volume constraints). Default true.
+
+    Declare the optimization side separately: add_design_var('twist', ...) for
+    the DVs named here, add_constraint('geometry.thickcon', ...) etc.
+    """
+    global mphys_geometry
+    require_problem()
+    if mphys_geometry is not None:
+        raise ValueError("A geometry is already recorded — one FFD geometry per "
+                         "problem (create_problem resets it).")
+    if not isinstance(ffd_file, str) or not ffd_file:
+        raise ValueError("ffd_file must be the FFD file path (as seen at run time).")
+    if ref_axis is not None:
+        _fields(ref_axis, {"name", "xFraction", "alignIndex"}, "ref_axis")
+        if not ref_axis.get("name"):
+            raise ValueError("ref_axis needs a 'name'.")
+    axis_names = {ref_axis["name"]} if ref_axis else set()
+    for gdv in global_dvs or []:
+        _fields(gdv, {"name", "axis", "sign", "skip_root"}, "global_dvs[]")
+        if not (isinstance(gdv.get("name"), str) and gdv["name"].isidentifier()):
+            raise ValueError("global_dvs[]: 'name' must be a valid variable name.")
+        if gdv.get("axis") not in axis_names:
+            raise ValueError(f"global_dvs[] '{gdv.get('name')}': axis "
+                             f"'{gdv.get('axis')}' does not match the ref_axis "
+                             f"name(s) {sorted(axis_names) or '(none recorded)'}.")
+    for ldv in local_dvs or []:
+        _fields(ldv, {"name", "point_select"}, "local_dvs[]")
+        if not (isinstance(ldv.get("name"), str) and ldv["name"].isidentifier()):
+            raise ValueError("local_dvs[]: 'name' must be a valid variable name.")
+    for gc in constraints or []:
+        kind = gc.get("kind")
+        if kind in ("thickness", "volume"):
+            _fields(gc, {"name", "kind", "leList", "teList", "nSpan", "nChord"},
+                    "constraints[]")
+            missing = [k for k in ("name", "leList", "teList", "nSpan", "nChord")
+                       if k not in gc]
+        elif kind == "le_te":
+            _fields(gc, {"name", "kind", "volID", "faceID"}, "constraints[]")
+            missing = [k for k in ("name", "volID", "faceID") if k not in gc]
+        else:
+            raise ValueError("constraints[]: 'kind' must be 'thickness', "
+                             "'volume', or 'le_te'.")
+        if missing:
+            raise ValueError(f"constraints[] '{gc.get('name')}': missing {missing}.")
+    mphys_geometry = {
+        "ffd_file": ffd_file,
+        "pointsets": list(pointsets) if pointsets else None,
+        "ref_axis": dict(ref_axis) if ref_axis else None,
+        "global_dvs": [dict(g) for g in (global_dvs or [])],
+        "local_dvs": [dict(g) for g in (local_dvs or [])],
+        "constraints": [dict(g) for g in (constraints or [])],
+        "constraint_surface": bool(constraint_surface),
+    }
+    n_dv = len(mphys_geometry["global_dvs"]) + len(mphys_geometry["local_dvs"])
+    return (f"FFD geometry recorded ({ffd_file}): {n_dv} design variable(s), "
+            f"{len(mphys_geometry['constraints'])} geometric constraint(s). "
+            "Declare bounds via add_design_var / add_constraint.")
+
+
+@mcp.tool()
+async def run_job(task: str = "run_model", np: int = 4, workdir: str = None,
+                  script_name: str = "mphys_runscript.py", trim: dict = None):
+    """
+    Generate the MPhys runscript (the SAME generator export_script uses), stage
+    it plus its callback files into the case directory, and execute it inside
+    the DAFoam Docker container with MPI — detached, so this returns a job_id
+    immediately. Poll with check_job_status(job_id); read the outcome with
+    fetch_results(job_id).
+
+    task:    'run_model' (primal once) | 'run_driver' (optimization) |
+             'compute_totals' (primal + adjoint) | 'check_totals'.
+    np:      MPI ranks for mpirun.
+    workdir: the case directory holding the OpenFOAM case (system/, constant/,
+             0.orig/, FFD/, *.bdf, preProcessing.sh). It must be visible inside
+             the container: either under the running container's bind mount, or
+             (fallback) it is mounted into a fresh `docker run` of the image.
+             If the mesh is not built yet (no constant/polyMesh/points),
+             preProcessing.sh is run first in the same job.
+    script_name: file name for the generated script inside workdir.
+    trim:    optional curated trim step, emitted ONLY inside the run_driver
+             branch: {"function": "scenario1.aero_post.CL", "design_var":
+             "patchV", "target": 0.5, "component": 1} -> DAFoam's
+             OptFuncs.findFeasibleDesign before prob.run_driver().
+    """
+    require_problem()
+    if task not in _MPHYS_TASKS:
+        raise ValueError(f"task must be one of {_MPHYS_TASKS}.")
+    if not _mphys_active():
+        raise ValueError("No MPhys state recorded — run_job executes MPhys "
+                         "problems; for a plain OpenMDAO problem use run().")
+    if not workdir:
+        raise ValueError("workdir is required: the case directory with the "
+                         "OpenFOAM case files (and tacsSetup.py etc.).")
+    workdir = os.path.abspath(os.path.expanduser(workdir))
+    if not os.path.isdir(workdir):
+        raise ValueError(f"workdir does not exist: {workdir}")
+    if not _docker_available():
+        raise ValueError("Docker is not available — start Docker Desktop, or "
+                         "use export_script and run the script yourself.")
+
+    source = _generate_mphys_script(task_default=task, trim=trim)
+    script_path = os.path.join(workdir, script_name)
+    with open(script_path, "w") as f:
+        f.write(source)
+    staged, missing = _stage_mphys_files(workdir, search_dirs=(workdir,))
+    if missing:
+        raise ValueError(f"Callback file(s) {missing} not found — place them in "
+                         f"{workdir} or record absolute paths in add_builder.")
+
+    _mphys_job_seq[0] += 1
+    job_id = f"mphys_{_mphys_job_seq[0]:03d}"
+    log_name = f"log_{job_id}.txt"
+    results_path = os.path.join(workdir, "results.json")
+    if os.path.exists(results_path):
+        os.remove(results_path)   # never let fetch_results read a stale run
+
+    steps = []
+    mesh_built = any(
+        os.path.isfile(os.path.join(workdir, "constant", "polyMesh", p))
+        for p in ("points", "points.gz"))
+    if not mesh_built and os.path.isfile(os.path.join(workdir, "preProcessing.sh")):
+        steps.append(f"./preProcessing.sh > log_preprocessing.txt 2>&1")
+    steps.append(f"mpirun -np {int(np)} python {script_name} -task {task} "
+                 f"> {log_name} 2>&1")
+
+    if _container_running(_DAFOAM_CONTAINER):
+        cpath = _container_path(_DAFOAM_CONTAINER, workdir)
+        if cpath is None:
+            raise ValueError(
+                f"workdir '{workdir}' is not visible inside the running "
+                f"'{_DAFOAM_CONTAINER}' container (not under any bind mount). "
+                "Move the case under the container's mounted directory, or stop "
+                "the container so run_job can mount the workdir itself.")
+        cmd = f"source {_DAFOAM_ENV_SH} && cd {cpath} && " + " && ".join(steps)
+        argv = ["docker", "exec", _DAFOAM_CONTAINER, "bash", "-c", cmd]
+    else:
+        mount = "/home/dafoamuser/mount_job"
+        cmd = f"source {_DAFOAM_ENV_SH} && cd {mount} && " + " && ".join(steps)
+        argv = ["docker", "run", "--rm", "-v", f"{workdir}:{mount}",
+                _DAFOAM_IMAGE, "bash", "-c", cmd]
+
+    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    _mphys_jobs[job_id] = {"proc": proc, "workdir": workdir, "task": task,
+                           "log": os.path.join(workdir, log_name),
+                           "script": script_path, "t0": time.time()}
+    return (f"Job '{job_id}' started: {task} with {int(np)} MPI rank(s) in "
+            f"{workdir} (script {script_name}, log {log_name}). "
+            "Poll with check_job_status; read results with fetch_results.")
+
+
+@mcp.tool()
+async def check_job_status(job_id: str):
+    """
+    Check a run_job job. Returns status ('running' | 'done' | 'failed'), the
+    exit code, elapsed seconds, and the tail of the job log. 'done' means the
+    process exited cleanly AND results.json was written; look at its 'status'
+    field (fetch_results) for the in-script success/failure.
+    """
+    job = _mphys_jobs.get(job_id)
+    if job is None:
+        raise ValueError(f"No job '{job_id}'. Known: {sorted(_mphys_jobs) or '(none)'}.")
+    rc = job["proc"].poll()
+    tail = ""
+    try:
+        with open(job["log"], errors="replace") as f:
+            tail = "".join(f.readlines()[-25:])
+    except OSError:
+        pass
+    results_exist = os.path.isfile(os.path.join(job["workdir"], "results.json"))
+    if rc is None:
+        status = "running"
+    elif rc == 0 and results_exist:
+        status = "done"
+    else:
+        status = "failed"
+    return {"job_id": job_id, "status": status, "exit_code": rc,
+            "task": job["task"], "elapsed_sec": round(time.time() - job["t0"], 1),
+            "results_json": results_exist, "log_tail": tail}
+
+
+@mcp.tool()
+async def fetch_results(job_id: str):
+    """
+    Read a finished job's results.json (functions, design_vars, totals,
+    iterations, wall time, error) and list the artifacts left in the workdir —
+    the N2 diagram (mphys.html), the optimizer history (OptView.hst), and the
+    logs. The workdir is bind-mounted, so the artifacts are already host-local;
+    the returned paths open directly.
+    """
+    job = _mphys_jobs.get(job_id)
+    if job is None:
+        raise ValueError(f"No job '{job_id}'. Known: {sorted(_mphys_jobs) or '(none)'}.")
+    if job["proc"].poll() is None:
+        raise ValueError(f"Job '{job_id}' is still running — poll check_job_status.")
+    results_path = os.path.join(job["workdir"], "results.json")
+    if not os.path.isfile(results_path):
+        tail = ""
+        try:
+            with open(job["log"], errors="replace") as f:
+                tail = "".join(f.readlines()[-25:])
+        except OSError:
+            pass
+        raise ValueError(f"Job '{job_id}' left no results.json (exit code "
+                         f"{job['proc'].returncode}). Log tail:\n{tail}")
+    with open(results_path) as f:
+        results = json.load(f)
+    artifacts = {}
+    for label, base in (("n2_diagram", "mphys.html"),
+                        ("history", "OptView.hst"),
+                        ("log", os.path.basename(job["log"])),
+                        ("preprocessing_log", "log_preprocessing.txt")):
+        p = os.path.join(job["workdir"], base)
+        if os.path.isfile(p):
+            artifacts[label] = p
+    return {"job_id": job_id, "results": results, "artifacts": artifacts}
 
 
 if __name__ == "__main__":

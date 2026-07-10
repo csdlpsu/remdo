@@ -12,8 +12,10 @@ import sys
 
 import pytest
 
-# The server module lives at the repo root (not an installed package).
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# The server module lives in ai_agent/mcp_server (not an installed package).
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "ai_agent", "mcp_server"))
 import openmdao_server as s
 
 
