@@ -138,7 +138,7 @@ def active_learning_loop(
                 warnings.simplefilter("error", OptimizationWarning)
 
                 # This step may result in an OptimizationWarning.
-                newmodel = _fit_multitask_model(trained_gp.model, train_x_mt, train_y_mt, dim, bounds_task)
+                newmodel = _fit_multitask_model(train_x_mt, train_y_mt, dim, bounds_task)
                 trained_gp.model = newmodel
                 
         except OptimizationWarning as e:
