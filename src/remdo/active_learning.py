@@ -14,6 +14,9 @@ from gpytorch.mlls import ExactMarginalLogLikelihood
 from scipy.optimize import minimize
 from torch.autograd.functional import hessian
 
+import warnings
+from botorch.exceptions.warnings import OptimizationWarning
+
 from .acquisition import _get_acq_func
 from .config import as_tensor, empty, tensor, to_numpy, zeros
 from .utils import standardize, unstandardize
@@ -108,8 +111,8 @@ def active_learning_loop(
         new_y = list(torch.diagonal(problem.res).unsqueeze(1))
         new_x_task = _append_task_feature(new_x, task_list)
 
-        if add_zero_points:
-            new_x_task, new_y = _add_zero_residual_points(new_x, new_x_task, new_y, coupling_dim, task_list)
+        # if add_zero_points:
+        #     new_x_task, new_y = _add_zero_residual_points(new_x, new_x_task, new_y, coupling_dim, task_list)
 
         train_x = [
             torch.vstack((per_task_x, per_task_new_x))
@@ -124,8 +127,30 @@ def active_learning_loop(
         train_y_mt = torch.cat(train_y_standardized).reshape(-1, 1)
         train_x_mt = torch.vstack(train_x)
 
-        model = _fit_multitask_model(train_x_mt, train_y_mt, dim, bounds_task)
-        trained_gp.model = model
+        # newmodel = _fit_multitask_model(trained_gp.model, train_x_mt, train_y_mt, dim, bounds_task)
+        # trained_gp.model = newmodel
+        # trained_gp.train_x = train_x
+        # trained_gp.train_y = train_y
+
+        # Update model
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", OptimizationWarning)
+
+                # This step may result in an OptimizationWarning.
+                newmodel = _fit_multitask_model(trained_gp.model, train_x_mt, train_y_mt, dim, bounds_task)
+                trained_gp.model = newmodel
+                
+        except OptimizationWarning as e:
+            trained_gp.model = trained_gp.model.condition_on_observations(
+                torch.vstack(new_x_task),
+                torch.cat(
+                    [y[-len(x):] for x, y in zip(new_x_task, train_y_standardized)]
+                ).reshape(-1, 1),
+            )
+            print(f"fit failed: {e}. updating posterior via condition_on_observations instead.")
+
+        # Update training sets
         trained_gp.train_x = train_x
         trained_gp.train_y = train_y
 
@@ -156,7 +181,6 @@ def active_learning_loop(
         )
 
     return trained_gp
-
 
 def _fit_multitask_model(train_x_mt, train_y_mt, dim, bounds_task):
     """Fit and return a multitask GP for stacked training data."""
