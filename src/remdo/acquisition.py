@@ -93,7 +93,7 @@ def lsts_constraint(model, seed=None) -> Callable:
     return [{'type':'eq', 'fun':eq_constraint}]
     
 
-def lsts_penalty(x: torch.Tensor, model, penalty_coefficient: float = 100.0, seed=1111) -> torch.Tensor:
+def lsts_penalty(x: torch.Tensor, model, penalty_coefficient: float = 100.0, seed=None) -> torch.Tensor:
     """Level set Thompson sampling acquisition.
 
     This acquisition selects points according to the probability that a 
