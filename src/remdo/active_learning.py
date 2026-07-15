@@ -139,10 +139,9 @@ def active_learning_loop(
 
                 # This step may result in an OptimizationWarning.
                 newmodel = _fit_multitask_model(train_x_mt, train_y_mt, dim, bounds_task)
-                trained_gp.model = newmodel
                 
         except OptimizationWarning as e:
-            trained_gp.model = trained_gp.model.condition_on_observations(
+            newmodel = trained_gp.model.condition_on_observations(
                 torch.vstack(new_x_task),
                 torch.cat(
                     [y[-len(x):] for x, y in zip(new_x_task, train_y_standardized)]
@@ -150,6 +149,8 @@ def active_learning_loop(
             )
             print(f"fit failed: {e}. updating posterior via condition_on_observations instead.")
 
+        trained_gp.model = newmodel
+        
         # Update training sets
         trained_gp.train_x = train_x
         trained_gp.train_y = train_y
