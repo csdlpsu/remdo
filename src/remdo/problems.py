@@ -45,3 +45,16 @@ __all__ = [
     "TurbineFeedback",
     "Turbine_feedback",
 ]
+
+PROBLEM_REGISTRY = {
+    cls.__name__: cls
+    for cls in (
+        Aerostructures,
+        Satellite,
+        SatelliteDirect,
+        SatelliteModified,
+        SatelliteModified3Dis,
+        Turbine,
+        TurbineFeedback,
+    )
+}

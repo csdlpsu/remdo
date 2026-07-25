@@ -14,6 +14,8 @@ from scipy.stats import qmc
 from .config import get_device, tensor
 from .utils import standardize
 
+from .problems import PROBLEM_REGISTRY
+
 
 class TrainedGP:
     """Container for a trained multitask GP and its associated data.
@@ -45,9 +47,15 @@ class TrainedGP:
             filename: Destination file path for :func:`torch.save`.
         """
 
+        # model_dict = {
+        #     "model": self.model,
+        #     "problem": type(self.problem),
+        #     "train_x": self.train_x,
+        #     "train_y": self.train_y,
+        # }
         model_dict = {
-            "model": self.model,
-            "problem": type(self.problem),
+            "model_state_dict": self.model.state_dict(),
+            "problem_class": type(self.problem).__name__,
             "train_x": self.train_x,
             "train_y": self.train_y,
         }
@@ -63,10 +71,29 @@ class TrainedGP:
         """
 
         model_dict = torch.load(filename, weights_only=False, map_location=map_location or get_device())
-        self.model = model_dict["model"]
+        # self.model = model_dict["model"]
+        # self.train_x = model_dict["train_x"]
+        # self.train_y = model_dict["train_y"]
+        # self.problem = model_dict["problem"]()
         self.train_x = model_dict["train_x"]
         self.train_y = model_dict["train_y"]
-        self.problem = model_dict["problem"]()
+
+        self.problem = PROBLEM_REGISTRY[model_dict["problem_class"]]()
+        bounds = self.problem.bounds
+        dim = self.problem.dim
+        task_list = list(self.problem.tasks)
+        bounds_task = torch.column_stack([bounds, tensor([min(task_list), max(task_list)])])
+        
+        self.model = MultiTaskGP(
+            torch.cat(self.train_x, dim=0),
+            torch.cat(self.train_y, dim=0).unsqueeze(-1),
+            task_feature = -1,
+            input_transform=Normalize(d=dim + 1, bounds=bounds_task, indices=list(range(dim))),
+            outcome_transform=None,
+        )
+        self.model.load_state_dict(
+            model_dict["model_state_dict"]
+        )
 
 
 def train_multitask_gp(
