@@ -149,7 +149,9 @@ def active_learning_loop(
             )
             print(f"fit failed: {e}. updating posterior via condition_on_observations instead.")
 
-        trained_gp.model = newmodel
+        # After fitting or conditioning success, accept model
+        model = newmodel
+        trained_gp.model = model
         
         # Update training sets
         trained_gp.train_x = train_x
