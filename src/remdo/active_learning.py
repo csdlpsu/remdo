@@ -267,7 +267,14 @@ def _save_model_snapshot(model, train_x, train_y, rep_count, iteration):
     )
 
 
-def convergence_obj(x_coupling: torch.Tensor, x_input: torch.Tensor, y, model, problem) -> torch.Tensor:
+def convergence_obj(
+    x_coupling: torch.Tensor,
+    x_input: torch.Tensor,
+    y,
+    model,
+    problem,
+    penalty_factor: float = 100.0,
+) -> torch.Tensor:
     """Compute the squared predicted residual norm for coupling variables.
 
     Args:
@@ -287,7 +294,7 @@ def convergence_obj(x_coupling: torch.Tensor, x_input: torch.Tensor, y, model, p
     for task_id, task in enumerate(problem.tasks):
         x_task = torch.column_stack([x, tensor([task])])
         pred = unstandardize(model.likelihood(model(x_task)), y[task_id], specify_mean=0.0)
-        obj = obj + pred.mean.square()
+        obj = obj + penalty_factor*pred.mean.square()
     return obj
 
 
