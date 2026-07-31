@@ -6,6 +6,7 @@ from collections.abc import Callable
 
 import torch
 from botorch.utils.transforms import normalize, unnormalize
+from botorch.sampling.normal import SobolQMCNormalSampler
 from scipy.optimize import Bounds, minimize
 from torch.distributions import Normal
 
@@ -53,16 +54,11 @@ def entropy(x: torch.Tensor, model) -> torch.Tensor:
     probability = normal.cdf(z(x, model)).clamp_min(as_tensor(0.01, dtype=x.dtype, device=x.device))
     return -probability * torch.log(probability) - (1.0 - probability) * torch.log(1.01 - probability)
 
-def lsts(x: torch.Tensor, model, input_is_normalized=True) -> torch.Tensor:
-    """Level set Thompson sampling acquisition.
+def variance(x: torch.Tensor, model, input_is_normalized=True) -> torch.Tensor:
+    """Max variance acquisition for Level set Thompson sampling.
 
-    This acquisition selects points according to the probability that a 
-    particular level is achieved. More specifically, the value of this 
-    acquisition is large where the GP posterior mean is zero and where the
-    posterior variance is high.
-
-    The equality constraint on the GP posterior mean is encoded as a quadratic
-    penalty term.
+    The value of this acquisition is large where the GP posterior variance is 
+    high. LSTS requires a constraint.
     
     Args:
         x: Candidate points in normalized coordinates, including task feature.
@@ -76,8 +72,6 @@ def lsts(x: torch.Tensor, model, input_is_normalized=True) -> torch.Tensor:
     posterior = model.posterior(x)
 
     return posterior.variance
-
-from botorch.sampling.normal import SobolQMCNormalSampler
 
 def lsts_constraint(model, seed=None) -> Callable:
     """Constraint for LSTS acquisition function.
@@ -397,7 +391,7 @@ def _get_acq_func(acquisition_name: str) -> Callable:
     if acquisition_name == "lsts_penalty":
         return multitask_acquisition(lsts_penalty, method="L-BFGS-B")
     elif acquisition_name == "lsts_constrained":
-        return multitask_acquisition(lsts, method="SLSQP", constraints=lsts_constraint)
+        return multitask_acquisition(variance, method="SLSQP", constraints=lsts_constraint)
     elif acquisition_name == "maximin":
         return multitask_acquisition(maximin, method="COBYQA")
     elif acquisition_name == "random":
