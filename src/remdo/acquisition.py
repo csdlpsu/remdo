@@ -114,7 +114,6 @@ def entropy_constraint(model, seed=None):
 
     return constraints_list
 
-
 def lsts_penalty(x: torch.Tensor, model, penalty_coefficient: float = 100.0, seed=None) -> torch.Tensor:
     """Level set Thompson sampling acquisition.
 
@@ -400,5 +399,7 @@ def _get_acq_func(acquisition_name: str) -> Callable:
         return mean_acquisition(entropy, method="L-BFGS-B")
     elif acquisition_name == "entropy_constrained":
         return multitask_acquisition(entropy, method="SLSQP", constraints=entropy_constraint)
+    elif acquisition_name == "maxvar_constrained":
+        return multitask_acquisition(variance, method="SLSQP", constraints=entropy_constraint)
     else:
         raise ValueError(f"Acquisition function '{acquisition_name}' undefined.")
