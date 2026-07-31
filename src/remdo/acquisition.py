@@ -6,6 +6,7 @@ from collections.abc import Callable
 
 import torch
 from botorch.utils.transforms import normalize, unnormalize
+from botorch.sampling.normal import SobolQMCNormalSampler
 from scipy.optimize import Bounds, minimize
 from torch.distributions import Normal
 
@@ -53,7 +54,7 @@ def entropy(x: torch.Tensor, model) -> torch.Tensor:
     probability = normal.cdf(z(x, model)).clamp_min(as_tensor(0.01, dtype=x.dtype, device=x.device))
     return -probability * torch.log(probability) - (1.0 - probability) * torch.log(1.01 - probability)
 
-def lsts(x: torch.Tensor, model, input_is_normalized=True) -> torch.Tensor:
+def lsts(x: torch.Tensor, model) -> torch.Tensor:
     """Level set Thompson sampling acquisition.
 
     This acquisition selects points according to the probability that a 
@@ -71,13 +72,13 @@ def lsts(x: torch.Tensor, model, input_is_normalized=True) -> torch.Tensor:
     Returns:
         LSTS acquisition values for each candidate point.
     """
-    if input_is_normalized:
-        x = model.input_transform.untransform(x)
-    posterior = model.posterior(x)
+    x_unnorm = model.input_transform.untransform(x)
+    posterior = model.posterior(x_unnorm)
 
-    return posterior.variance
+    sampler = SobolQMCNormalSampler(torch.Size([1]), seed=seed)
+    sample = sampler(posterior).flatten()
 
-from botorch.sampling.normal import SobolQMCNormalSampler
+    return posterior.variance.flatten()
 
 def lsts_constraint(model, seed=None) -> Callable:
     """Constraint for LSTS acquisition function.
