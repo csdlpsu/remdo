@@ -91,7 +91,35 @@ def lsts_constraint(model, seed=None) -> Callable:
         posterior = model.posterior(x.unsqueeze(0))
         return sampler(posterior).flatten() 
     return [{'type':'eq', 'fun':eq_constraint}]
-    
+
+
+def entropy_constraint(model, seed=None):
+    """Constraint for constrained entropy.
+
+    Constrains acquisition point to lie on predicted residual mean of all tasks.
+    """
+
+    tfidx = model._task_feature
+    task_list = model.train_inputs[0][:, tfidx].unique(sorted=True)
+
+    constraints_list = []
+
+    for task in task_list:
+
+        def eq_constraint(x, task=task):
+            u = model.input_transform.untransform(x).clone()
+            u[tfidx] = task
+
+            posterior = model.posterior(u.unsqueeze(0))
+            return posterior.mean.flatten()
+
+        constraints_list.append({
+            "type": "eq",
+            "fun": eq_constraint,
+        })
+
+    return constraints_list
+
 
 def lsts_penalty(x: torch.Tensor, model, penalty_coefficient: float = 100.0, seed=None) -> torch.Tensor:
     """Level set Thompson sampling acquisition.
@@ -376,5 +404,7 @@ def _get_acq_func(acquisition_name: str) -> Callable:
         return random_acquisition()
     elif acquisition_name == "mean entropy":
         return mean_acquisition(entropy, method="L-BFGS-B")
+    elif acquisition_name == "entropy_constrained":
+        return multitask_acquisition(entropy, method="SLSQP", constraints=entropy_constraint)
     else:
         raise ValueError(f"Acquisition function '{acquisition_name}' undefined.")
