@@ -51,8 +51,13 @@ def entropy(x: torch.Tensor, model) -> torch.Tensor:
     """
 
     normal = Normal(as_tensor(0.0, dtype=x.dtype, device=x.device), as_tensor(1.0, dtype=x.dtype, device=x.device))
-    probability = normal.cdf(z(x, model)).clamp_min(as_tensor(0.01, dtype=x.dtype, device=x.device))
-    return -probability * torch.log(probability) - (1.0 - probability) * torch.log(1.01 - probability)
+    # probability = normal.cdf(z(x, model)).clamp_min(as_tensor(0.01, dtype=x.dtype, device=x.device))
+    # return -probability * torch.log(probability) - (1.0 - probability) * torch.log(1.01 - probability)
+
+    eps = 1e-6
+    p = normal.cdf(z(x, model)).clamp(eps, 1 - eps)
+
+    return -p * torch.log(p) - (1 - p) * torch.log(1 - p)
 
 def variance(x: torch.Tensor, model, input_is_normalized=True) -> torch.Tensor:
     """Max variance acquisition for Level set Thompson sampling.
@@ -387,7 +392,7 @@ def _get_acq_func(acquisition_name: str) -> Callable:
 
     if acquisition_name == "entropy":
         return multitask_acquisition(entropy, method="L-BFGS-B")
-    if acquisition_name == "lsts_penalty":
+    elif acquisition_name == "lsts_penalty":
         return multitask_acquisition(lsts_penalty, method="L-BFGS-B")
     elif acquisition_name == "lsts_constrained":
         return multitask_acquisition(variance, method="SLSQP", constraints=lsts_constraint)
