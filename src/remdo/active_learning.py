@@ -19,7 +19,7 @@ from botorch.exceptions.warnings import OptimizationWarning
 
 from .acquisition import _get_acq_func
 from .config import as_tensor, empty, tensor, to_numpy, zeros
-from .utils import standardize, unstandardize
+from .utils import standardize, unstandardize#, StratifiedStandardizeZeroMean
 
 
 def _task_bounds(problem) -> torch.Tensor:
@@ -47,6 +47,7 @@ def active_learning_loop(
     log_hyperparams: bool = False,
     rep_count: int | None = None,
     add_zero_points: bool = False,
+    standardize_output: bool = False,
 ):
     """Run active learning for a trained multitask residual GP.
 
@@ -138,7 +139,7 @@ def active_learning_loop(
                 warnings.simplefilter("error", OptimizationWarning)
 
                 # This step may result in an OptimizationWarning.
-                newmodel = _fit_multitask_model(train_x_mt, train_y_mt, dim, bounds_task)
+                newmodel = _fit_multitask_model(train_x_mt, train_y_mt, dim, bounds_task, task_list, standardize_output)
                 
         except OptimizationWarning as e:
             newmodel = trained_gp.model.condition_on_observations(
@@ -164,6 +165,7 @@ def active_learning_loop(
             history["intersection_history"] = update_history_list(
                 history["dist_history"],
                 history["intersection_history"],
+                history["least_squares_obj"],
                 trained_gp,
                 history["input_list"],
                 history["truth_list"],
@@ -179,15 +181,34 @@ def active_learning_loop(
                 "dist_history": tensor(history["dist_history"]).reshape(-1, len(history["input_list"])),
                 "intersection_history": history["intersection_history"],
                 "truth_list": history["truth_list"],
+                "least_squares_obj": tensor(history["least_squares_obj"]).reshape(-1, len(history["input_list"])),
             },
             history["filename"],
         )
 
     return trained_gp
 
-def _fit_multitask_model(train_x_mt, train_y_mt, dim, bounds_task):
+def _fit_multitask_model(train_x_mt, train_y_mt, dim, bounds_task, task_list, standardize_output):
     """Fit and return a multitask GP for stacked training data."""
 
+    # if standardize_output:
+    #     model = MultiTaskGP(
+    #         train_x_mt,
+    #         train_y_mt,
+    #         task_feature=-1,
+    #         input_transform=Normalize(d=dim + 1, bounds=bounds_task, indices=list(range(dim))),
+    #         outcome_transform=StratifiedStandardizeZeroMean(stratification_idx=-1, 
+    #                                                         all_task_values=torch.as_tensor(task_list)
+    #                                                        ),
+    #     )
+    # else:
+    #     model = MultiTaskGP(
+    #         train_x_mt,
+    #         train_y_mt,
+    #         task_feature=-1,
+    #         input_transform=Normalize(d=dim + 1, bounds=bounds_task, indices=list(range(dim))),
+    #         outcome_transform=None,
+    #     )
     model = MultiTaskGP(
         train_x_mt,
         train_y_mt,
@@ -214,6 +235,8 @@ def _initialize_history(save_hist, trained_gp):
     truth_list = empty(0, coupling_dim)
     dist_history = []
     intersection_history = empty(0, dim)
+    lsq_obj_history = []
+    
 
     if truth_from == "openmdao":
         for input_vec in input_list:
@@ -224,9 +247,12 @@ def _initialize_history(save_hist, trained_gp):
     else:
         raise ValueError("truth source must be 'openmdao' or 'specify'.")
 
+    # print('truth:', truth_list)
+
     intersection_history = update_history_list(
         dist_history,
         intersection_history,
+        lsq_obj_history,
         trained_gp,
         input_list,
         truth_list,
@@ -239,6 +265,7 @@ def _initialize_history(save_hist, trained_gp):
         "num_evals": [sum(per_task_y.numel() for per_task_y in trained_gp.train_y)],
         "dist_history": dist_history,
         "intersection_history": intersection_history,
+        "least_squares_obj": lsq_obj_history,
     }
 
 
@@ -296,7 +323,7 @@ def convergence_obj(
     for task_id, task in enumerate(problem.tasks):
         x_task = torch.column_stack([x, tensor([task])])
         pred = unstandardize(model.likelihood(model(x_task)), y[task_id], specify_mean=0.0)
-        obj = obj + penalty_factor*pred.mean.square()
+        obj = obj + 0.5*penalty_factor*pred.mean.square()
     return obj
 
 
@@ -370,16 +397,24 @@ def residual_intersection(u0: torch.Tensor, input_vec: torch.Tensor, trained_gp)
         hess=convergence_obj_hess_scipy,
     )
 
-    return unnormalize(tensor(result.x), bounds[:, input_dim:])
+    return unnormalize(tensor(result.x), bounds[:, input_dim:]), result.fun
 
 
 def convergence_dist(u_candidate: torch.Tensor, truth: torch.Tensor) -> torch.Tensor:
     """Return Euclidean distance between candidate and reference vectors."""
+    # print('truth',truth)
+    # print('u',u_candidate)
 
     return torch.linalg.norm(u_candidate - truth)
 
 
-def update_history_list(dist_history, intersection_history, trained_gp, input_list, truth_list):
+def update_history_list(
+    dist_history, 
+    intersection_history, 
+    lsq_obj_history, 
+    trained_gp, 
+    input_list, 
+    truth_list):
     """Append residual-intersection diagnostics to active-learning history.
 
     Args:
@@ -399,7 +434,7 @@ def update_history_list(dist_history, intersection_history, trained_gp, input_li
     input_dim = problem.input_dim
 
     for input_vec, truth in zip(input_list, truth_list):
-        u_candidate = residual_intersection(truth, input_vec, trained_gp)
+        u_candidate, fun = residual_intersection(truth, input_vec, trained_gp)
         x_candidate = torch.cat((input_vec, u_candidate))
         dist = convergence_dist(
             normalize(u_candidate, bounds[:, input_dim:]),
@@ -407,5 +442,6 @@ def update_history_list(dist_history, intersection_history, trained_gp, input_li
         )
         dist_history.append(float(to_numpy(dist)))
         intersection_history = torch.vstack((intersection_history, x_candidate))
+        lsq_obj_history.append(fun.item())
 
     return intersection_history

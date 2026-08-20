@@ -46,13 +46,18 @@ class MDA(ABC):
     def set_vars(self, x: torch.Tensor) -> None:
         """Set the full problem variable matrix used by residual properties."""
 
-    def set_bounds(self, bounds: torch.Tensor) -> None:
-        """Set full-variable bounds after validating the expected shape."""
+    def set_bounds(self, bounds: torch.Tensor, indices: Sequence[int] | None = None) -> None:
+        """Set bounds at specified column indices after validating the expected shape."""
 
         bounds = as_tensor(bounds)
         if bounds.shape != (2, self.dim):
             raise ValueError(f"Expected bounds shape {(2, self.dim)}, got {tuple(bounds.shape)}.")
-        self._bounds = bounds
+
+        if indices is None:
+            self._bounds = bounds
+        else:
+            indices = list(indices)
+            self._bounds[:, indices] = bounds[:, indices]
 
     @abstractmethod
     def from_OpenMDAO(self, x_input: torch.Tensor) -> torch.Tensor:
