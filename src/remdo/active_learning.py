@@ -11,7 +11,7 @@ from botorch.models import MultiTaskGP
 from botorch.models.transforms import Normalize
 from botorch.utils.transforms import normalize, unnormalize
 from gpytorch.mlls import ExactMarginalLogLikelihood
-from scipy.optimize import minimize
+from scipy.optimize import minimize, shgo, Bounds
 from torch.autograd.functional import hessian
 
 import warnings
@@ -383,7 +383,13 @@ def residual_intersection(u0: torch.Tensor, input_vec: torch.Tensor, trained_gp)
     problem = trained_gp.problem
     bounds = problem.bounds
     input_dim = problem.input_dim
+    coupling_dim = problem.coupling_dim
     y = trained_gp.train_y
+
+    coupling_bounds = Bounds(
+        torch.zeros(coupling_dim),
+        torch.ones(coupling_dim),
+    )
 
     u0_normalized = normalize(as_tensor(u0), bounds[:, input_dim:])
     input_normalized = normalize(as_tensor(input_vec), bounds[:, :input_dim])
@@ -397,8 +403,24 @@ def residual_intersection(u0: torch.Tensor, input_vec: torch.Tensor, trained_gp)
         hess=convergence_obj_hess_scipy,
     )
 
-    return unnormalize(tensor(result.x), bounds[:, input_dim:]), result.fun
+    best_result = result
 
+    # Global optimization fallback
+    max_retries = 5
+    retry = 0
+    while result.fun > 1e-6 and retry < max_retries:
+        result = shgo(convergence_obj_scipy,
+                      coupling_bounds,
+                      args=(input_normalized, y, model, problem),
+                      n=32 * 2**retry,
+                      sampling_method='sobol',
+                     )
+        retry += 1
+
+        if result.fun < best_result.fun:
+            best_result = result
+
+    return unnormalize(tensor(result.x), bounds[:, input_dim:]), result.fun
 
 def convergence_dist(u_candidate: torch.Tensor, truth: torch.Tensor) -> torch.Tensor:
     """Return Euclidean distance between candidate and reference vectors."""
