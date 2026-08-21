@@ -302,7 +302,7 @@ def convergence_obj(
     y,
     model,
     problem,
-    penalty_factor: float = 100.0,
+    penalty_factor: float = 10.0,
 ) -> torch.Tensor:
     """Compute the squared predicted residual norm for coupling variables.
 
@@ -320,10 +320,16 @@ def convergence_obj(
 
     x = torch.hstack((x_input.unsqueeze(0), x_coupling))
     obj = zeros(1, dtype=x.dtype, device=x.device)
+
     for task_id, task in enumerate(problem.tasks):
         x_task = torch.column_stack([x, tensor([task])])
-        pred = unstandardize(model.likelihood(model(x_task)), y[task_id], specify_mean=0.0)
-        obj = obj + 0.5*penalty_factor*pred.mean.square()
+        posterior = model.posterior(model.input_transform.untransform(x_task))
+        pred_mean = unstandardize(
+            posterior.mean,
+            y[task_id],
+            specify_mean=0.0,
+        )
+        obj = obj + 0.5 * penalty_factor * pred_mean.square()
     return obj
 
 
@@ -366,7 +372,7 @@ def convergence_obj_hess_scipy(x_coupling, x_input, y, model, problem):
     return to_numpy(convergence_obj_hess(x_coupling_tens, x_input, y, model, problem).squeeze()).astype("float64")
 
 
-def residual_intersection(u0: torch.Tensor, input_vec: torch.Tensor, trained_gp) -> torch.Tensor:
+def residual_intersection(u0: torch.Tensor, input_vec: torch.Tensor, trained_gp, fallback=True) -> torch.Tensor:
     """Solve for coupling variables that minimize predicted residuals.
 
     Args:
@@ -405,22 +411,23 @@ def residual_intersection(u0: torch.Tensor, input_vec: torch.Tensor, trained_gp)
 
     best_result = result
 
-    # Global optimization fallback
-    max_retries = 5
-    retry = 0
-    while result.fun > 1e-6 and retry < max_retries:
-        result = shgo(convergence_obj_scipy,
-                      coupling_bounds,
-                      args=(input_normalized, y, model, problem),
-                      n=32 * 2**retry,
-                      sampling_method='sobol',
-                     )
-        retry += 1
+    if fallback:
+        # Global optimization fallback
+        max_retries = 5
+        retry = 0
+        while result.fun > 1e-6 and retry < max_retries:
+            result = shgo(convergence_obj_scipy,
+                          coupling_bounds,
+                          args=(input_normalized, y, model, problem),
+                          n=128 * 2**retry,
+                          sampling_method='sobol',
+                         )
+            retry += 1
 
-        if result.fun < best_result.fun:
-            best_result = result
+            if result.fun < best_result.fun:
+                best_result = result
 
-    return unnormalize(tensor(result.x), bounds[:, input_dim:]), result.fun
+    return unnormalize(tensor(result.x), bounds[:, input_dim:]), best_result.fun
 
 def convergence_dist(u_candidate: torch.Tensor, truth: torch.Tensor) -> torch.Tensor:
     """Return Euclidean distance between candidate and reference vectors."""
