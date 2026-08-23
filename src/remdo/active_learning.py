@@ -6,13 +6,15 @@ from collections.abc import Callable
 from pathlib import Path
 
 import torch
+import numpy as np
 from botorch.fit import fit_gpytorch_mll
 from botorch.models import MultiTaskGP
 from botorch.models.transforms import Normalize
 from botorch.utils.transforms import normalize, unnormalize
 from gpytorch.mlls import ExactMarginalLogLikelihood
-from scipy.optimize import minimize, shgo, Bounds
-from torch.autograd.functional import hessian
+from scipy.optimize import Bounds, minimize, NonlinearConstraint, root, shgo
+from functools import partial
+from torch.autograd.functional import jacobian, hessian
 
 import warnings
 from botorch.exceptions.warnings import OptimizationWarning
@@ -302,7 +304,7 @@ def convergence_obj(
     y,
     model,
     problem,
-    penalty_factor: float = 10.0,
+    penalty_factor: float = 1.0,
 ) -> torch.Tensor:
     """Compute the squared predicted residual norm for coupling variables.
 
@@ -372,63 +374,6 @@ def convergence_obj_hess_scipy(x_coupling, x_input, y, model, problem):
     return to_numpy(convergence_obj_hess(x_coupling_tens, x_input, y, model, problem).squeeze()).astype("float64")
 
 
-def residual_intersection(u0: torch.Tensor, input_vec: torch.Tensor, trained_gp, fallback=True) -> torch.Tensor:
-    """Solve for coupling variables that minimize predicted residuals.
-
-    Args:
-        u0: Initial coupling-variable guess in original problem coordinates.
-        input_vec: Fixed external input vector in original problem coordinates.
-        trained_gp: :class:`remdo.gp.TrainedGP` with fitted model and training
-            data.
-
-    Returns:
-        Coupling variables in original problem coordinates.
-    """
-
-    model = trained_gp.model
-    problem = trained_gp.problem
-    bounds = problem.bounds
-    input_dim = problem.input_dim
-    coupling_dim = problem.coupling_dim
-    y = trained_gp.train_y
-
-    coupling_bounds = Bounds(
-        torch.zeros(coupling_dim),
-        torch.ones(coupling_dim),
-    )
-
-    u0_normalized = normalize(as_tensor(u0), bounds[:, input_dim:])
-    input_normalized = normalize(as_tensor(input_vec), bounds[:, :input_dim])
-
-    result = minimize(
-        convergence_obj_scipy,
-        to_numpy(u0_normalized),
-        method="Newton-CG",
-        args=(input_normalized, y, model, problem),
-        jac=convergence_obj_grad_scipy,
-        hess=convergence_obj_hess_scipy,
-    )
-
-    best_result = result
-
-    if fallback:
-        # Global optimization fallback
-        max_retries = 5
-        retry = 0
-        while result.fun > 1e-6 and retry < max_retries:
-            result = shgo(convergence_obj_scipy,
-                          coupling_bounds,
-                          args=(input_normalized, y, model, problem),
-                          n=128 * 2**retry,
-                          sampling_method='sobol',
-                         )
-            retry += 1
-
-            if result.fun < best_result.fun:
-                best_result = result
-
-    return unnormalize(tensor(result.x), bounds[:, input_dim:]), best_result.fun
-
 def convergence_dist(u_candidate: torch.Tensor, truth: torch.Tensor) -> torch.Tensor:
     """Return Euclidean distance between candidate and reference vectors."""
     # print('truth',truth)
@@ -474,3 +419,186 @@ def update_history_list(
         lsq_obj_history.append(fun.item())
 
     return intersection_history
+
+
+def residual_constraints(
+    x_coupling: torch.Tensor,
+    x_input: torch.Tensor,
+    y,
+    model,
+    problem,
+) -> torch.Tensor:
+    """
+    Return vector of unstandardized residual predictions.
+    Shape: (n_tasks,)
+    """
+
+    x = torch.hstack((x_input.unsqueeze(0), x_coupling))
+
+    residuals = []
+
+    for task_id, task in enumerate(problem.tasks):
+        x_task = torch.column_stack([x, tensor([task])])
+
+        posterior = model.posterior(
+            model.input_transform.untransform(x_task)
+        )
+
+        pred_mean = unstandardize(
+            posterior.mean,
+            y[task_id],
+            specify_mean=0.0,
+        )
+
+        residuals.append(pred_mean.squeeze())
+
+    return torch.stack(residuals)
+
+
+def residual_constraints_scipy(
+    x_coupling,
+    x_input,
+    y,
+    model,
+    problem,
+):
+    x_coupling_tens = tensor(x_coupling).unsqueeze(0)
+
+    return to_numpy(
+        residual_constraints(
+            x_coupling_tens,
+            x_input,
+            y,
+            model,
+            problem,
+        )
+    ).astype("float64")
+
+
+def residual_constraints_jac(
+    x_coupling: torch.Tensor,
+    x_input: torch.Tensor,
+    y,
+    model,
+    problem,
+):
+    def fun(xc):
+        return residual_constraints(
+            xc,
+            x_input,
+            y,
+            model,
+            problem,
+        )
+
+    return jacobian(fun, x_coupling).squeeze()
+
+
+def residual_constraints_jac_scipy(
+    x_coupling,
+    x_input,
+    y,
+    model,
+    problem,
+):
+    x_coupling_tens = tensor(x_coupling).unsqueeze(0)
+
+    return to_numpy(
+        residual_constraints_jac(
+            x_coupling_tens,
+            x_input,
+            y,
+            model,
+            problem,
+        )
+    ).astype("float64")
+
+
+def residual_intersection(
+    u0: torch.Tensor,
+    input_vec: torch.Tensor,
+    trained_gp,
+    use_fallback: bool = False,
+    max_retries: int = 3,
+    ftol: float = 1e-6,
+) -> torch.Tensor:
+    """Solve for coupling variables that minimize predicted residuals."""
+
+    model = trained_gp.model
+    problem = trained_gp.problem
+    bounds = problem.bounds
+    input_dim = problem.input_dim
+    coupling_dim = problem.coupling_dim
+    y = trained_gp.train_y
+
+    u0_normalized = normalize(as_tensor(u0), bounds[:, input_dim:])
+    input_normalized = normalize(as_tensor(input_vec), bounds[:, :input_dim])
+
+    best_result = None
+    residual_norm = np.inf
+    best_error = np.inf
+
+    try:
+        result = root(
+            partial(
+                residual_constraints_scipy,
+                x_input=input_normalized,
+                y=y,
+                model=model,
+                problem=problem,
+            ),
+            to_numpy(u0_normalized),
+            jac=partial(
+                residual_constraints_jac_scipy,
+                x_input=input_normalized,
+                y=y,
+                model=model,
+                problem=problem,
+            ),
+            method="hybr",
+        )
+        best_result = result
+        residual_norm = np.linalg.norm(result.fun) # 2-norm
+        # residual_norm = np.max(np.abs(result.fun)) # infinity norm
+        best_error = residual_norm
+
+    except Exception:
+        result = None
+
+    should_fallback = (
+        use_fallback
+        and (
+            result is None
+            or not result.success
+            or residual_norm > ftol
+        )
+    )
+
+    if should_fallback:
+        coupling_bounds = Bounds(
+            torch.zeros(coupling_dim),
+            torch.ones(coupling_dim),
+        )
+        for retry in range(max_retries):
+            shgo_result = shgo(
+                convergence_obj_scipy,
+                coupling_bounds,
+                args=(input_normalized, y, model, problem),
+                n=128 * (2**retry),
+                sampling_method="sobol",
+            )
+
+            if (
+                best_result is None
+                or shgo_result.fun < best_error
+            ):
+                best_result = shgo_result
+                best_error = shgo_result.fun
+
+            if shgo_result.fun <= ftol:
+                break
+
+    return (
+        unnormalize(tensor(best_result.x), bounds[:, input_dim:]),
+        best_error,
+    )
