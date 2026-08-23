@@ -558,8 +558,8 @@ def residual_intersection(
             method="hybr",
         )
         best_result = result
-        residual_norm = np.linalg.norm(result.fun) # 2-norm
-        # residual_norm = np.max(np.abs(result.fun)) # infinity norm
+        # residual_norm = np.linalg.norm(result.fun) # 2-norm
+        residual_norm = np.max(np.abs(result.fun)) # infinity norm
         best_error = residual_norm
 
     except Exception:
@@ -602,3 +602,89 @@ def residual_intersection(
         unnormalize(tensor(best_result.x), bounds[:, input_dim:]),
         best_error,
     )
+
+from scipy.stats import qmc
+
+def _estimate_equilibrium_bounds(
+    model,
+    problem,
+    n_samples: int = 64,
+    max_retries: int = 8,
+    tol: float = 1e-6,
+) -> torch.Tensor:
+    """Estimate the coupling-variable bounds of the equilibrium set.
+
+    This function samples the problem design space using a Sobol sequence and
+    uses the provided model to estimate the bounds of the equilibrium manifold
+    in the coupling-variable space.
+
+    Args:
+        model: REMDO GP model.
+        problem: REMDO problem definition.
+        n_samples: Optional. Number of points in the Sobol sample.
+        max_retries: Optional. Maximum number of root-finding retries
+            if the initial attempt fails.
+        tol: Optional. Residual infinity norm from root finding method.
+
+    Returns:
+        A (2, coupling_dim) tensor containing the estimated bounds.
+
+    Raises:
+        RuntimeError: If no equilibrium intersections are found.
+    """
+
+    input_dim = problem.input_dim
+    coupling_dim = problem.coupling_dim
+
+    input_bounds = problem.bounds[:, :input_dim]
+    coupling_bounds = problem.bounds[:, input_dim:]
+
+    input_sampler = qmc.Sobol(d=input_dim, scramble=True)
+    input_sample = qmc.scale(input_sampler.random(n=n_samples),
+                             *input_bounds,
+                            )
+
+    coupling_sampler = qmc.Sobol(d=coupling_dim, scramble=True)
+
+    intersections = [] # store intersection points
+
+    for input_vec in input_sample:
+        x0 = coupling_bounds.mean(dim=0) # center of coupling bounds
+        for _ in range(max_retries+1):
+            res, err = residual_intersection(
+                x0,
+                torch.as_tensor(
+                    input_vec,
+                    dtype=coupling_bounds.dtype,
+                    device=coupling_bounds.device,
+                ),
+                model,
+                use_fallback=False,
+            )
+
+            if not np.isfinite(err) or err >= tol:
+                coupling_sample = qmc.scale(coupling_sampler.random(n=1),
+                                            *coupling_bounds,
+                                           )
+                x0 = torch.as_tensor(
+                    coupling_sample,
+                    dtype=coupling_bounds.dtype,
+                    device=coupling_bounds.device,
+                ).squeeze(0)
+            else:
+                break
+
+        if np.isfinite(err) and err < tol:
+            intersections.append(res)
+
+    if len(intersections) > 0:
+        intersections = torch.stack(intersections)
+        lb_estimate = intersections.amin(dim=0)
+        ub_estimate = intersections.amax(dim=0)
+        bounds_estimate = torch.vstack((lb_estimate, ub_estimate))
+        return bounds_estimate
+    else:
+        raise RuntimeError(
+            f"Failed to find any equilibrium intersections after "
+            f"{n_samples} samples and {max_retries} retries per sample."
+        )
