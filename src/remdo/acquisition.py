@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 
 import torch
+import numpy as np
 from botorch.utils.transforms import normalize, unnormalize
 from botorch.sampling.normal import SobolQMCNormalSampler
 from scipy.optimize import Bounds, minimize
@@ -210,52 +211,55 @@ def optimize_acquisition(
     """
 
     bounds = problem.bounds
-    dim = bounds.size(1)
 
-    if initial_guess == 'multistart':
-        x_samples = sample_in_bounds(bounds, num_samples, specify_input)
-        x_normalized = normalize(x_samples, bounds)
-    
-        if task_no is not None:
-            task_col = torch.full((num_samples, 1), task_no, dtype=x_normalized.dtype, device=x_normalized.device)
-            x_samples_task = torch.column_stack([x_normalized, task_col])
-        else:
-            x_samples_task = x_normalized
-
-        sample_max_index = torch.argmax(acqf(x_samples_task, model))
-        
-        x0 = x_normalized[sample_max_index]
-        
-    elif initial_guess == 'random':
-        x0 = torch.rand(dim, dtype=bounds.dtype, device=bounds.device)
-        
-    x0_scipy = torch.cat((x0, tensor([task_no]))) if task_no is not None else x0
-
-    bounds_norm = torch.stack(
-        (
-            torch.zeros(dim, dtype=bounds.dtype, device=bounds.device),
-            torch.ones(dim, dtype=bounds.dtype, device=bounds.device),
-        )
-    )
+    # Normalize bounds for minimization
+    # If input is provided, constrain bounds to that value only
     if specify_input is not None:
-        input_len = len(specify_input)
-        input_norm = normalize(as_tensor(specify_input), bounds[:, :input_len])
-        bounds_norm[:, :input_len] = input_norm
-
-    if task_no is not None:
-        bounds_norm_task = torch.column_stack([bounds_norm, tensor([task_no, task_no])])
+        # TODO: assert specify_input shape (can be list or tensor, as_tensor handles it)
+        bounds_fixed_input = bounds.clone()
+        bounds_fixed_input[:, :problem.input_dim] = as_tensor(specify_input)
+        bounds_norm = model.input_transform(bounds_fixed_input)
     else:
-        bounds_norm_task = bounds_norm
+        bounds_norm = model.input_transform(bounds)
 
-    scipy_bounds = Bounds(to_numpy(bounds_norm_task[0, :]), to_numpy(bounds_norm_task[1, :]))
+    # SciPy format bounds
+    scipy_bounds = Bounds(*to_numpy(bounds_norm))
+
+    # Determine x0
+    if initial_guess == 'multistart':
+        x_samples = sample_in_bounds(bounds_norm, num_samples)
+        if task_no is not None:
+            task_col = torch.full(
+                (num_samples, 1),
+                task_no,
+                dtype=x_samples.dtype,
+                device=x_samples.device,
+            )
+            x_samples_task = torch.column_stack((x_samples, task_col))
+        else:
+            x_samples_task = x_samples
+        sample_max_index = torch.argmax(acqf(x_samples_task, model))
+        x0 = x_samples[sample_max_index]
+    elif initial_guess == 'random':
+        x0 = sample_in_bounds(bounds_norm, 1).flatten()
+    else: # default to center of bounds
+        x0 = bounds_norm.mean(dim=0)
+
+    # Optimization objective
+    acqf_scipy = func_scipy(acqf)
+    acqf_grad_scipy = func_scipy(func_grad(acqf))
+
+    def augment_x(x):
+        return x if task_no is None else np.append(x, task_no)
 
     def neg_acqf(x, model):
-        return -func_scipy(acqf)(x, model)
+        return -acqf_scipy(augment_x(x), model)
 
     def neg_acqf_grad(x, model):
-        return -func_scipy(func_grad(acqf))(x, model)
+        grad = acqf_grad_scipy(augment_x(x), model)
+        return -grad[:-1] if task_no is not None else -grad
 
-        
+    # Handle constraints
     scipy_constraints = None
     if constraints is not None:
         scipy_constraints = []
@@ -273,12 +277,11 @@ def optimize_acquisition(
 
             scipy_constraints.append(wrapped)
 
-
     result = minimize(
         neg_acqf,
-        to_numpy(x0_scipy),
+        to_numpy(x0),
         method=method,
-        args=model,
+        args=(model, ),
         jac=neg_acqf_grad,
         options={"ftol": 1e-9},
         bounds=scipy_bounds,
@@ -287,9 +290,8 @@ def optimize_acquisition(
 
     result_x = tensor(result.x)
     result_value = -tensor(result.fun)
-    if task_no is not None:
-        return unnormalize(result_x[:-1], bounds), result_value
-    return unnormalize(result_x, bounds), result_value
+
+    return model.input_transform.untransform(result_x), result_value
 
 def multitask_acquisition(
     acqf: AcquisitionFunction,
