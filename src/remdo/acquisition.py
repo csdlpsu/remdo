@@ -107,10 +107,14 @@ def entropy_constraint(model, seed=None):
     for task in task_list:
 
         def eq_constraint(x, task=task):
-            u = model.input_transform.untransform(x).clone()
-            u[tfidx] = task
+            u = torch.cat(
+                (
+                    model.input_transform.untransform(x).clone(),
+                    tensor([task])
+                )
+            )
 
-            posterior = model.posterior(u.unsqueeze(0))
+            posterior = model.posterior(torch.atleast_2d(u))
             return posterior.mean.flatten()
 
         constraints_list.append({

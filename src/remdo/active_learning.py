@@ -48,8 +48,10 @@ def active_learning_loop(
     save_hist: tuple[torch.Tensor, str, str] | None = None,
     log_hyperparams: bool = False,
     rep_count: int | None = None,
-    add_zero_points: bool = False,
+    # add_zero_points: bool = False,
     standardize_output: bool = False,
+    enable_bounds_refinement: bool = False,
+    bounds_refinement_frequency: int = 10,
 ):
     """Run active learning for a trained multitask residual GP.
 
@@ -89,6 +91,27 @@ def active_learning_loop(
     dim = problem.dim
     input_dim = problem.input_dim
     coupling_dim = problem.coupling_dim
+
+    # Estimate bounds of equilibrium set
+    def _update_bounds(trained_gp):
+        problem = trained_gp.problem
+        estimated_bounds = _estimate_equilibrium_bounds(trained_gp)
+        # try:
+        #     estimated_bounds = _estimate_equilibrium_bounds(trained_gp)
+        #     # Update problem bounds
+        #     # problem.bounds[:, problem.input_dim:] = estimated_bounds
+        # except Exception:
+        #     # If bounds estimation fails, keep bounds the same
+        #     # estimated_bounds = problem.bounds[:, problem.input_dim:]
+        #     print('bounds estimation failed')
+        #     estimated_bounds = None
+        return estimated_bounds
+
+    estimated_bounds = _update_bounds(trained_gp).unsqueeze(0)
+    print(estimated_bounds)
+
+    if enable_bounds_refinement:
+        bounds_task = _task_bounds(problem)
 
     if isinstance(acq_method, str):
         acq_func = _get_acq_func(acq_method)
@@ -159,6 +182,17 @@ def active_learning_loop(
         # Update training sets
         trained_gp.train_x = train_x
         trained_gp.train_y = train_y
+
+        # Update estimated bounds
+        updated_estimated_bounds = _update_bounds(trained_gp)
+        print(updated_estimated_bounds)
+
+        # estimated_bounds = torch.cat((estimated_bounds, updated_estimated_bounds.unsqueeze(0)))
+        # print(estimated_bounds[-10:,:,:].mean(dim=0))
+        # print(estimated_bounds[-10:,:,:].std(dim=0))
+
+        if enable_bounds_refinement:
+            bounds_task = _task_bounds(problem)
 
         if log_hyperparams:
             _save_model_snapshot(model, train_x, train_y, rep_count, iteration)
@@ -271,18 +305,18 @@ def _initialize_history(save_hist, trained_gp):
     }
 
 
-def _add_zero_residual_points(new_x, new_x_task, new_y, coupling_dim, task_list):
-    """Add deprecated auxiliary zero-residual training points."""
+# def _add_zero_residual_points(new_x, new_x_task, new_y, coupling_dim, task_list):
+#     """Add deprecated auxiliary zero-residual training points."""
 
-    new_x_zero = [x.clone() for x in new_x]
-    for offset, (x, y) in enumerate(zip(new_x_zero, new_y)):
-        x[-(coupling_dim - offset)] -= y.squeeze()
+#     new_x_zero = [x.clone() for x in new_x]
+#     for offset, (x, y) in enumerate(zip(new_x_zero, new_y)):
+#         x[-(coupling_dim - offset)] -= y.squeeze()
 
-    new_y_zero = [zeros(1, 1, dtype=y.dtype, device=y.device) for y in new_y]
-    new_x_zero_task = _append_task_feature(new_x_zero, task_list)
-    new_x_task = [torch.vstack((x, x_zero)) for x, x_zero in zip(new_x_task, new_x_zero_task)]
-    new_y = [torch.cat((y, y_zero)) for y, y_zero in zip(new_y, new_y_zero)]
-    return new_x_task, new_y
+#     new_y_zero = [zeros(1, 1, dtype=y.dtype, device=y.device) for y in new_y]
+#     new_x_zero_task = _append_task_feature(new_x_zero, task_list)
+#     new_x_task = [torch.vstack((x, x_zero)) for x, x_zero in zip(new_x_task, new_x_zero_task)]
+#     new_y = [torch.cat((y, y_zero)) for y, y_zero in zip(new_y, new_y_zero)]
+#     return new_x_task, new_y
 
 
 def _save_model_snapshot(model, train_x, train_y, rep_count, iteration):
@@ -531,8 +565,27 @@ def residual_intersection(
     coupling_dim = problem.coupling_dim
     y = trained_gp.train_y
 
-    u0_normalized = normalize(as_tensor(u0), bounds[:, input_dim:])
-    input_normalized = normalize(as_tensor(input_vec), bounds[:, :input_dim])
+    # u0 = torch.as_tensor(
+    #     u0,
+    #     dtype=bounds.dtype,
+    #     device=bounds.device,
+    # )
+    # input_vec = torch.as_tensor(
+    #     input_vec,
+    #     dtype=bounds.dtype,
+    #     device=bounds.device,
+    # )
+    u0 = torch.as_tensor(u0)
+    input_vec = torch.as_tensor(input_vec)
+    
+    x = torch.cat((input_vec, u0))
+    
+    normalized = model.input_transform(
+        x.unsqueeze(0)
+    ).squeeze(0)
+    
+    input_normalized = normalized[:input_dim]
+    u0_normalized = normalized[input_dim:]
 
     best_result = None
     residual_norm = np.inf
@@ -598,16 +651,22 @@ def residual_intersection(
             if shgo_result.fun <= ftol:
                 break
 
+    # return (
+    #     unnormalize(tensor(best_result.x), bounds[:, input_dim:]),
+    #     best_error,
+    # )
+    intersection_full = model.input_transform.untransform(torch.hstack((input_normalized, tensor(best_result.x))))
     return (
-        unnormalize(tensor(best_result.x), bounds[:, input_dim:]),
+        intersection_full[input_dim:],
         best_error,
     )
 
 from scipy.stats import qmc
 
 def _estimate_equilibrium_bounds(
-    model,
-    problem,
+    # model,
+    # problem,
+    trained_gp,
     n_samples: int = 64,
     max_retries: int = 8,
     tol: float = 1e-6,
@@ -633,6 +692,8 @@ def _estimate_equilibrium_bounds(
         RuntimeError: If no equilibrium intersections are found.
     """
 
+    problem = trained_gp.problem
+    
     input_dim = problem.input_dim
     coupling_dim = problem.coupling_dim
 
@@ -641,7 +702,7 @@ def _estimate_equilibrium_bounds(
 
     input_sampler = qmc.Sobol(d=input_dim, scramble=True)
     input_sample = qmc.scale(input_sampler.random(n=n_samples),
-                             *input_bounds,
+                             *to_numpy(input_bounds),
                             )
 
     coupling_sampler = qmc.Sobol(d=coupling_dim, scramble=True)
@@ -658,13 +719,13 @@ def _estimate_equilibrium_bounds(
                     dtype=coupling_bounds.dtype,
                     device=coupling_bounds.device,
                 ),
-                model,
+                trained_gp,
                 use_fallback=False,
             )
 
             if not np.isfinite(err) or err >= tol:
                 coupling_sample = qmc.scale(coupling_sampler.random(n=1),
-                                            *coupling_bounds,
+                                            *to_numpy(coupling_bounds),
                                            )
                 x0 = torch.as_tensor(
                     coupling_sample,
@@ -679,8 +740,10 @@ def _estimate_equilibrium_bounds(
 
     if len(intersections) > 0:
         intersections = torch.stack(intersections)
-        lb_estimate = intersections.amin(dim=0)
-        ub_estimate = intersections.amax(dim=0)
+        # lb_estimate = intersections.amin(dim=0)
+        # ub_estimate = intersections.amax(dim=0)
+        lb_estimate = torch.quantile(intersections, 0.01, dim=0)
+        ub_estimate = torch.quantile(intersections, 0.99, dim=0)
         bounds_estimate = torch.vstack((lb_estimate, ub_estimate))
         return bounds_estimate
     else:
