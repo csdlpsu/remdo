@@ -12,6 +12,7 @@ from botorch.models import MultiTaskGP
 from botorch.models.transforms import Normalize
 from botorch.utils.transforms import normalize, unnormalize
 from gpytorch.mlls import ExactMarginalLogLikelihood
+from gpytorch.settings import prior_mode
 from scipy.optimize import Bounds, minimize, NonlinearConstraint, root, shgo
 from functools import partial
 from torch.autograd.functional import jacobian, hessian
@@ -51,7 +52,8 @@ def active_learning_loop(
     # add_zero_points: bool = False,
     standardize_output: bool = False,
     enable_bounds_refinement: bool = False,
-    bounds_refinement_frequency: int = 10,
+    # bounds_refinement_frequency: int = 10,
+    bounds_expansion_factor: float = 1.10,
 ):
     """Run active learning for a trained multitask residual GP.
 
@@ -92,26 +94,38 @@ def active_learning_loop(
     input_dim = problem.input_dim
     coupling_dim = problem.coupling_dim
 
-    # Estimate bounds of equilibrium set
+    estimated_bounds = None
+
     def _update_bounds(trained_gp):
+        """Estimate and update the equilibrium-set bounds."""
         problem = trained_gp.problem
-        estimated_bounds = _estimate_equilibrium_bounds(trained_gp)
-        # try:
-        #     estimated_bounds = _estimate_equilibrium_bounds(trained_gp)
-        #     # Update problem bounds
-        #     # problem.bounds[:, problem.input_dim:] = estimated_bounds
-        # except Exception:
-        #     # If bounds estimation fails, keep bounds the same
-        #     # estimated_bounds = problem.bounds[:, problem.input_dim:]
-        #     print('bounds estimation failed')
-        #     estimated_bounds = None
+    
+        try:
+            estimated_bounds = _estimate_equilibrium_bounds(trained_gp)
+    
+            # Expand bounds slightly about center by scale factor
+            bounds_center = estimated_bounds.mean(dim=0)
+            bounds_range = estimated_bounds.diff(dim=0)
+    
+            expanded_bounds = (
+                bounds_center + bounds_expansion_factor * tensor([[-1], [1]]) @ bounds_range / 2
+            )
+    
+            # Update the coupling-variable bounds
+            problem.bounds[:, problem.input_dim:] = expanded_bounds
+    
+        except Exception as e:
+            print(f"Bounds estimation failed: {e}.")
+            estimated_bounds = None
+    
         return estimated_bounds
 
-    estimated_bounds = _update_bounds(trained_gp).unsqueeze(0)
+    estimated_bounds = _update_bounds(trained_gp)
     print(estimated_bounds)
 
     if enable_bounds_refinement:
         bounds_task = _task_bounds(problem)
+        print(bounds_task)
 
     if isinstance(acq_method, str):
         acq_func = _get_acq_func(acq_method)
@@ -137,9 +151,6 @@ def active_learning_loop(
         new_y = list(torch.diagonal(problem.res).unsqueeze(1))
         new_x_task = _append_task_feature(new_x, task_list)
 
-        # if add_zero_points:
-        #     new_x_task, new_y = _add_zero_residual_points(new_x, new_x_task, new_y, coupling_dim, task_list)
-
         train_x = [
             torch.vstack((per_task_x, per_task_new_x))
             for per_task_x, per_task_new_x in zip(train_x, new_x_task)
@@ -153,18 +164,20 @@ def active_learning_loop(
         train_y_mt = torch.cat(train_y_standardized).reshape(-1, 1)
         train_x_mt = torch.vstack(train_x)
 
-        # newmodel = _fit_multitask_model(trained_gp.model, train_x_mt, train_y_mt, dim, bounds_task)
-        # trained_gp.model = newmodel
-        # trained_gp.train_x = train_x
-        # trained_gp.train_y = train_y
-
         # Update model
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("error", OptimizationWarning)
 
                 # This step may result in an OptimizationWarning.
-                newmodel = _fit_multitask_model(train_x_mt, train_y_mt, dim, bounds_task, task_list, standardize_output)
+                newmodel = _fit_multitask_model(
+                    train_x_mt,
+                    train_y_mt,
+                    dim,
+                    bounds_task,
+                    task_list,
+                    standardize_output
+                )
                 
         except OptimizationWarning as e:
             newmodel = trained_gp.model.condition_on_observations(
@@ -184,15 +197,12 @@ def active_learning_loop(
         trained_gp.train_y = train_y
 
         # Update estimated bounds
-        updated_estimated_bounds = _update_bounds(trained_gp)
-        print(updated_estimated_bounds)
-
-        # estimated_bounds = torch.cat((estimated_bounds, updated_estimated_bounds.unsqueeze(0)))
-        # print(estimated_bounds[-10:,:,:].mean(dim=0))
-        # print(estimated_bounds[-10:,:,:].std(dim=0))
+        estimated_bounds = _update_bounds(trained_gp)
+        print(estimated_bounds)
 
         if enable_bounds_refinement:
             bounds_task = _task_bounds(problem)
+            print(bounds_task)
 
         if log_hyperparams:
             _save_model_snapshot(model, train_x, train_y, rep_count, iteration)
@@ -223,6 +233,7 @@ def active_learning_loop(
         )
 
     return trained_gp
+
 
 def _fit_multitask_model(train_x_mt, train_y_mt, dim, bounds_task, task_list, standardize_output):
     """Fit and return a multitask GP for stacked training data."""
@@ -442,7 +453,7 @@ def update_history_list(
     input_dim = problem.input_dim
 
     for input_vec, truth in zip(input_list, truth_list):
-        u_candidate, fun = residual_intersection(truth, input_vec, trained_gp)
+        u_candidate, fun, std_ratio = residual_intersection(truth, input_vec, trained_gp)
         x_candidate = torch.cat((input_vec, u_candidate))
         dist = convergence_dist(
             normalize(u_candidate, bounds[:, input_dim:]),
@@ -618,47 +629,68 @@ def residual_intersection(
     except Exception:
         result = None
 
-    should_fallback = (
-        use_fallback
-        and (
-            result is None
-            or not result.success
-            or residual_norm > ftol
-        )
-    )
+    # should_fallback = (
+    #     use_fallback
+    #     and (
+    #         result is None
+    #         or not result.success
+    #         or residual_norm > ftol
+    #     )
+    # )
 
-    if should_fallback:
-        coupling_bounds = Bounds(
-            torch.zeros(coupling_dim),
-            torch.ones(coupling_dim),
-        )
-        for retry in range(max_retries):
-            shgo_result = shgo(
-                convergence_obj_scipy,
-                coupling_bounds,
-                args=(input_normalized, y, model, problem),
-                n=128 * (2**retry),
-                sampling_method="sobol",
-            )
+    # if should_fallback:
+    #     coupling_bounds = Bounds(
+    #         torch.zeros(coupling_dim),
+    #         torch.ones(coupling_dim),
+    #     )
+    #     for retry in range(max_retries):
+    #         shgo_result = shgo(
+    #             convergence_obj_scipy,
+    #             coupling_bounds,
+    #             args=(input_normalized, y, model, problem),
+    #             n=128 * (2**retry),
+    #             sampling_method="sobol",
+    #         )
 
-            if (
-                best_result is None
-                or shgo_result.fun < best_error
-            ):
-                best_result = shgo_result
-                best_error = shgo_result.fun
+    #         if (
+    #             best_result is None
+    #             or shgo_result.fun < best_error
+    #         ):
+    #             best_result = shgo_result
+    #             best_error = shgo_result.fun
 
-            if shgo_result.fun <= ftol:
-                break
+    #         if shgo_result.fun <= ftol:
+    #             break
 
     # return (
     #     unnormalize(tensor(best_result.x), bounds[:, input_dim:]),
     #     best_error,
     # )
-    intersection_full = model.input_transform.untransform(torch.hstack((input_normalized, tensor(best_result.x))))
+
+    intersection_full = torch.hstack((input_normalized, tensor(best_result.x)))
+    intersection_full_unnorm = model.input_transform.untransform(intersection_full)
+
+    stddev_ratio = []
+    
+    for task in trained_gp.problem.tasks:
+        # x = torch.atleast_2d(torch.cat((intersection_full, as_tensor([task]))))
+        x_unnorm = torch.atleast_2d(torch.cat((intersection_full_unnorm, as_tensor([task]))))
+    
+        posterior = model.posterior(x_unnorm)
+        posterior_stddev = posterior.stddev.item()
+        # print(posterior.stddev)
+    
+        with prior_mode(True):
+            # prior_stddev = trained_gp.model(x).stddev.item()
+            # print(trained_gp.model(x).stddev)
+            prior_stddev = trained_gp.model(x_unnorm).stddev.item()
+
+        stddev_ratio.append(posterior_stddev/prior_stddev)
+
     return (
-        intersection_full[input_dim:],
+        intersection_full_unnorm[input_dim:],
         best_error,
+        np.array(stddev_ratio),
     )
 
 from scipy.stats import qmc
@@ -670,6 +702,7 @@ def _estimate_equilibrium_bounds(
     n_samples: int = 64,
     max_retries: int = 8,
     tol: float = 1e-6,
+    acceptance_ratio: float = 0.6,
 ) -> torch.Tensor:
     """Estimate the coupling-variable bounds of the equilibrium set.
 
@@ -712,7 +745,7 @@ def _estimate_equilibrium_bounds(
     for input_vec in input_sample:
         x0 = coupling_bounds.mean(dim=0) # center of coupling bounds
         for _ in range(max_retries+1):
-            res, err = residual_intersection(
+            res, err, std_ratio = residual_intersection(
                 x0,
                 torch.as_tensor(
                     input_vec,
@@ -735,7 +768,7 @@ def _estimate_equilibrium_bounds(
             else:
                 break
 
-        if np.isfinite(err) and err < tol:
+        if np.isfinite(err) and err < tol and np.all(std_ratio < acceptance_ratio):
             intersections.append(res)
 
     if len(intersections) > 0:
