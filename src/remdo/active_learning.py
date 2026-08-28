@@ -220,14 +220,19 @@ def active_learning_loop(
         print("done")
 
     if history is not None:
+        ninputs = len(history["input_list"])
         torch.save(
             {
                 "num_evals": history["num_evals"],
                 # "dist_history": tensor(history["dist_history"]).reshape(-1, len(history["input_list"])),
-                "intersection_history": torch.stack(history["intersection_history"]).cpu().numpy(),
-                "std_ratio_history": np.stack(history["std_ratio_history"]),
-                "root_residual_history": np.array(history["root_residual_history"]).reshape(-1, len(history["input_list"])),
-                "bounds_history": torch.stack(history["bounds_history"]).cpu().numpy(),
+                "intersection_history": torch.stack(history["intersection_history"])
+                    .reshape(-1, ninputs, dim).transpose(0, 1).cpu().numpy(),
+                "std_ratio_history": np.stack(history["std_ratio_history"])
+                    .reshape(-1, ninputs, coupling_dim).swapaxes(0, 1),
+                "root_residual_history": np.array(history["root_residual_history"])
+                    .reshape(-1, ninputs).swapaxes(0, 1),
+                "bounds_history": torch.stack(history["bounds_history"])
+                    .reshape(-1, 2, dim).cpu().numpy(),
                 "truth_list": history["truth_list"].cpu().numpy(),
             },
             history["filename"],
@@ -418,8 +423,9 @@ def update_history_list(history, trained_gp):
 
         history["intersection_history"].append(torch.cat((input_vec, u_candidate)))
         history["std_ratio_history"].append(std_ratio)
-        history["bounds_history"].append(trained_gp.problem.bounds.clone())
         history["root_residual_history"].append(fun.item())
+
+    history["bounds_history"].append(trained_gp.problem.bounds.clone())
 
 
 def residual_constraints(
