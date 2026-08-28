@@ -120,12 +120,12 @@ def active_learning_loop(
     
         return estimated_bounds
 
-    estimated_bounds = _update_bounds(trained_gp)
-    print(estimated_bounds)
+    # estimated_bounds = _update_bounds(trained_gp)
+    # print(estimated_bounds)
 
     if enable_bounds_refinement:
         bounds_task = _task_bounds(problem)
-        print(bounds_task)
+        # print(bounds_task)
 
     if isinstance(acq_method, str):
         acq_func = _get_acq_func(acq_method)
@@ -197,12 +197,12 @@ def active_learning_loop(
         trained_gp.train_y = train_y
 
         # Update estimated bounds
-        estimated_bounds = _update_bounds(trained_gp)
-        print(estimated_bounds)
+        # estimated_bounds = _update_bounds(trained_gp)
+        # print(estimated_bounds)
 
         if enable_bounds_refinement:
             bounds_task = _task_bounds(problem)
-            print(bounds_task)
+            # print(bounds_task)
 
         if log_hyperparams:
             _save_model_snapshot(model, train_x, train_y, rep_count, iteration)
@@ -227,8 +227,9 @@ def active_learning_loop(
                 "num_evals": history["num_evals"],
                 # "dist_history": tensor(history["dist_history"]).reshape(-1, len(history["input_list"])),
                 "intersection_history": history["intersection_history"],
+                "std_ratio_history": history["std_ratio_history"],
                 "root_residual_history": tensor(history["root_residual_history"]).reshape(-1, len(history["input_list"])),
-                "bounds_history": history["bounds_history"]
+                "bounds_history": history["bounds_history"],
                 "truth_list": history["truth_list"],
             },
             history["filename"],
@@ -355,6 +356,7 @@ def _initialize_history(save_hist, trained_gp):
             sum(per_task_y.numel() for per_task_y in trained_gp.train_y)
         ],
         "intersection_history": [],
+        "std_ratio_history": [],
         "bounds_history": [],
         "root_residual_history": [],
     }
@@ -416,12 +418,9 @@ def update_history_list(history, trained_gp):
             trained_gp,
         )
 
-        history["intersection_history"].append(
-            torch.cat((input_vec, u_candidate))
-        )
-        history["bounds_history"].append(
-            trained_gp.problem.bounds.clone()
-        )
+        history["intersection_history"].append(torch.cat((input_vec, u_candidate)))
+        history["std_ratio_history"].append(std_ratio)
+        history["bounds_history"].append(trained_gp.problem.bounds.clone())
         history["root_residual_history"].append(fun.item())
 
 
