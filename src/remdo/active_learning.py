@@ -112,7 +112,8 @@ def active_learning_loop(
             )
     
             # Update the coupling-variable bounds
-            problem.bounds[:, problem.input_dim:] = expanded_bounds
+            # problem.bounds[:, problem.input_dim:] = expanded_bounds
+            problem.set_bounds(expanded_bounds, range(-coupling_dim, 0))
     
         except Exception as e:
             print(f"Bounds estimation failed: {e}.")

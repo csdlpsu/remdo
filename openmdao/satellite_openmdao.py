@@ -115,6 +115,7 @@ class Satellite(MDA):
         self._u12 = zeros(1)
         self._u21 = zeros(1)
         self._bounds = tensor([[0.0, 0.0, 0.0, 0.0, 0.0, 6.0, 6.0], [2.0, 2.0, 2.0, 2.0, 2.0, 12.0, 20.0]])
+        # self._bounds = tensor([[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0], [2.0, 2.0, 2.0, 2.0, 2.0, 18.72, 28.72]])
         self._dim = 7
         self._input_dim = 5
         self._coupling_dim = 2
@@ -167,6 +168,12 @@ class Satellite(MDA):
         self._x = x[:, : self.input_dim]
         self._u12 = x[:, -2]
         self._u21 = x[:, -1]
+
+    def set_bounds(self, bounds, indices=None):
+        super().set_bounds(bounds, indices)
+
+        # Enforce u21 > 0 
+        self._bounds[0, 6] = max(self._bounds[0, 6], 0.0)
 
     def _run_OpenMDAO(self, x_input: torch.Tensor):
         """Run the OpenMDAO satellite model for a fixed input vector."""

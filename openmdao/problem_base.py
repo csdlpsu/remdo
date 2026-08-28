@@ -50,14 +50,34 @@ class MDA(ABC):
         """Set bounds at specified column indices after validating the expected shape."""
 
         bounds = as_tensor(bounds)
-        if bounds.shape != (2, self.dim):
-            raise ValueError(f"Expected bounds shape {(2, self.dim)}, got {tuple(bounds.shape)}.")
+        # if indices is None and bounds.shape != (2, self.dim):
+        #     raise ValueError(f"Expected bounds shape {(2, self.dim)}, got {tuple(bounds.shape)}.")
 
+        # if indices is None:
+        #     self._bounds = bounds
+        # else:
+        #     indices = list(indices)
+        #     self._bounds[:, indices] = bounds[:, indices]
+
+        # full bounds
         if indices is None:
+            if bounds.shape != (2, self.dim):
+                raise ValueError(f"Expected bounds shape {(2, self.dim)}, got {tuple(bounds.shape)}.")
             self._bounds = bounds
+
+        # partial bounds
         else:
             indices = list(indices)
-            self._bounds[:, indices] = bounds[:, indices]
+    
+            if bounds.shape == (2, self.dim):
+                self._bounds[:, indices] = bounds[:, indices]
+            elif bounds.shape == (2, len(indices)):
+                self._bounds[:, indices] = bounds
+            else:
+                raise ValueError(
+                    f"Expected bounds shape {(2, self.dim)} or {(2, len(indices))}, "
+                    f"got {tuple(bounds.shape)}."
+                )
 
     @abstractmethod
     def from_OpenMDAO(self, x_input: torch.Tensor) -> torch.Tensor:
