@@ -120,10 +120,9 @@ def active_learning_loop(
     
         return estimated_bounds
 
-    # estimated_bounds = _update_bounds(trained_gp)
-    # print(estimated_bounds)
-
     if enable_bounds_refinement:
+        estimated_bounds = _update_bounds(trained_gp)
+        # print(estimated_bounds)
         bounds_task = _task_bounds(problem)
         # print(bounds_task)
 
@@ -196,11 +195,10 @@ def active_learning_loop(
         trained_gp.train_x = train_x
         trained_gp.train_y = train_y
 
-        # Update estimated bounds
-        # estimated_bounds = _update_bounds(trained_gp)
-        # print(estimated_bounds)
-
         if enable_bounds_refinement:
+            # Update estimated bounds
+            estimated_bounds = _update_bounds(trained_gp)
+            # print(estimated_bounds)
             bounds_task = _task_bounds(problem)
             # print(bounds_task)
 
@@ -226,11 +224,11 @@ def active_learning_loop(
             {
                 "num_evals": history["num_evals"],
                 # "dist_history": tensor(history["dist_history"]).reshape(-1, len(history["input_list"])),
-                "intersection_history": history["intersection_history"],
-                "std_ratio_history": history["std_ratio_history"],
-                "root_residual_history": tensor(history["root_residual_history"]).reshape(-1, len(history["input_list"])),
-                "bounds_history": history["bounds_history"],
-                "truth_list": history["truth_list"],
+                "intersection_history": torch.stack(history["intersection_history"]).cpu().numpy(),
+                "std_ratio_history": np.stack(history["std_ratio_history"]),
+                "root_residual_history": np.array(history["root_residual_history"]).reshape(-1, len(history["input_list"])),
+                "bounds_history": torch.stack(history["bounds_history"]).cpu().numpy(),
+                "truth_list": history["truth_list"].cpu().numpy(),
             },
             history["filename"],
         )
