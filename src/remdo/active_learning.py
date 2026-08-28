@@ -208,14 +208,15 @@ def active_learning_loop(
             _save_model_snapshot(model, train_x, train_y, rep_count, iteration)
 
         if history is not None:
-            history["intersection_history"] = update_history_list(
-                history["dist_history"],
-                history["intersection_history"],
-                history["least_squares_obj"],
-                trained_gp,
-                history["input_list"],
-                history["truth_list"],
-            )
+            # history["intersection_history"] = update_history_list(
+            #     history["dist_history"],
+            #     history["intersection_history"],
+            #     history["root_residual_history"],
+            #     trained_gp,
+            #     history["input_list"],
+            #     history["truth_list"],
+            # )
+            update_history_list(history, trained_gp)
 
     if disp:
         print("done")
@@ -224,10 +225,11 @@ def active_learning_loop(
         torch.save(
             {
                 "num_evals": history["num_evals"],
-                "dist_history": tensor(history["dist_history"]).reshape(-1, len(history["input_list"])),
+                # "dist_history": tensor(history["dist_history"]).reshape(-1, len(history["input_list"])),
                 "intersection_history": history["intersection_history"],
+                "root_residual_history": tensor(history["root_residual_history"]).reshape(-1, len(history["input_list"])),
+                "bounds_history": history["bounds_history"]
                 "truth_list": history["truth_list"],
-                "least_squares_obj": tensor(history["least_squares_obj"]).reshape(-1, len(history["input_list"])),
             },
             history["filename"],
         )
@@ -268,53 +270,193 @@ def _fit_multitask_model(train_x_mt, train_y_mt, dim, bounds_task, task_list, st
     return model
 
 
+# def _initialize_history(save_hist, trained_gp):
+#     """Prepare history-tracking state for active-learning diagnostics."""
+
+#     problem = trained_gp.problem
+#     input_dim = problem.input_dim
+#     coupling_dim = problem.coupling_dim
+#     dim = problem.dim
+
+#     input_list = as_tensor(save_hist[0]).reshape(-1, input_dim)
+#     filename = save_hist[1]
+#     truth_from = save_hist[2]
+#     truth_list = empty(0, coupling_dim)
+#     dist_history = []
+#     intersection_history = empty(0, dim)
+#     lsq_obj_history = []
+
+
+#     if truth_from == "openmdao":
+#         for input_vec in input_list:
+#             assert input_vec.size(0) == input_dim
+#             truth_list = torch.vstack((truth_list, as_tensor(problem.from_OpenMDAO(input_vec))))
+#     elif truth_from == "specify":
+#         truth_list = as_tensor(save_hist[3])
+#     else:
+#         raise ValueError("truth source must be 'openmdao' or 'specify'.")
+
+#     # print('truth:', truth_list)
+
+#     intersection_history = update_history_list(
+#         dist_history,
+#         intersection_history,
+#         lsq_obj_history,
+#         trained_gp,
+#         input_list,
+#         truth_list,
+#     )
+
+#     return {
+#         "input_list": input_list,
+#         "filename": filename,
+#         "truth_list": truth_list,
+#         "num_evals": [sum(per_task_y.numel() for per_task_y in trained_gp.train_y)],
+#         "dist_history": dist_history,
+#         "intersection_history": intersection_history,
+#         "least_squares_obj": lsq_obj_history,
+#     }
+
+
 def _initialize_history(save_hist, trained_gp):
     """Prepare history-tracking state for active-learning diagnostics."""
 
     problem = trained_gp.problem
     input_dim = problem.input_dim
     coupling_dim = problem.coupling_dim
-    dim = problem.dim
 
     input_list = as_tensor(save_hist[0]).reshape(-1, input_dim)
     filename = save_hist[1]
     truth_from = save_hist[2]
-    truth_list = empty(0, coupling_dim)
-    dist_history = []
-    intersection_history = empty(0, dim)
-    lsq_obj_history = []
-    
 
     if truth_from == "openmdao":
-        for input_vec in input_list:
-            assert input_vec.size(0) == input_dim
-            truth_list = torch.vstack((truth_list, as_tensor(problem.from_OpenMDAO(input_vec))))
+        truth_tensors = [
+            as_tensor(problem.from_OpenMDAO(input_vec))
+            for input_vec in input_list
+        ]
+
+        truth_list = (
+            torch.stack(truth_tensors)
+            if truth_tensors
+            else empty(0, coupling_dim)
+        )
+
     elif truth_from == "specify":
         truth_list = as_tensor(save_hist[3])
+
     else:
         raise ValueError("truth source must be 'openmdao' or 'specify'.")
 
-    # print('truth:', truth_list)
-
-    intersection_history = update_history_list(
-        dist_history,
-        intersection_history,
-        lsq_obj_history,
-        trained_gp,
-        input_list,
-        truth_list,
-    )
-
-    return {
+    history = {
         "input_list": input_list,
         "filename": filename,
         "truth_list": truth_list,
-        "num_evals": [sum(per_task_y.numel() for per_task_y in trained_gp.train_y)],
-        "dist_history": dist_history,
-        "intersection_history": intersection_history,
-        "least_squares_obj": lsq_obj_history,
+        "num_evals": [
+            sum(per_task_y.numel() for per_task_y in trained_gp.train_y)
+        ],
+        "intersection_history": [],
+        "bounds_history": [],
+        "root_residual_history": [],
     }
 
+    update_history_list(history, trained_gp)
+
+    return history
+
+
+# def update_history_list(
+#     dist_history,
+#     intersection_history,
+#     lsq_obj_history,
+#     trained_gp, 
+#     input_list, 
+#     truth_list):
+#     """Append residual-intersection diagnostics to active-learning history.
+
+#     Args:
+#         dist_history: Mutable list of normalized coupling-space distances.
+#         intersection_history: Tensor of previously computed full intersection
+#             points.
+#         trained_gp: Trained GP wrapper.
+#         input_list: Iterable of fixed input vectors.
+#         truth_list: Iterable of reference coupling solutions.
+
+#     Returns:
+#         Updated ``intersection_history`` tensor.
+#     """
+
+#     problem = trained_gp.problem
+#     bounds = problem.bounds
+#     input_dim = problem.input_dim
+
+#     for input_vec, truth in zip(input_list, truth_list):
+#         u_candidate, fun, std_ratio = residual_intersection(truth, input_vec, trained_gp)
+#         x_candidate = torch.cat((input_vec, u_candidate))
+#         dist = convergence_dist(
+#             normalize(u_candidate, bounds[:, input_dim:]),
+#             normalize(truth, bounds[:, input_dim:]),
+#         )
+#         dist_history.append(float(to_numpy(dist)))
+#         intersection_history = torch.vstack((intersection_history, x_candidate))
+#         lsq_obj_history.append(fun.item())
+
+#     return intersection_history
+
+
+def update_history_list(history, trained_gp):
+    """Append residual-intersection diagnostics to active-learning history."""
+
+    for input_vec, truth in zip(
+        history["input_list"],
+        history["truth_list"],
+    ):
+        u_candidate, fun, std_ratio = residual_intersection(
+            truth,
+            input_vec,
+            trained_gp,
+        )
+
+        history["intersection_history"].append(
+            torch.cat((input_vec, u_candidate))
+        )
+        history["bounds_history"].append(
+            trained_gp.problem.bounds.clone()
+        )
+        history["root_residual_history"].append(fun.item())
+
+
+def residual_constraints(
+    x_coupling: torch.Tensor,
+    x_input: torch.Tensor,
+    y,
+    model,
+    problem,
+) -> torch.Tensor:
+    """
+    Return vector of unstandardized residual predictions.
+    Shape: (n_tasks,)
+    """
+
+    x = torch.hstack((x_input.unsqueeze(0), x_coupling))
+
+    residuals = []
+
+    for task_id, task in enumerate(problem.tasks):
+        x_task = torch.column_stack([x, tensor([task])])
+
+        posterior = model.posterior(
+            model.input_transform.untransform(x_task)
+        )
+
+        pred_mean = unstandardize(
+            posterior.mean,
+            y[task_id],
+            specify_mean=0.0,
+        )
+
+        residuals.append(pred_mean.squeeze())
+
+    return torch.stack(residuals)
 
 # def _add_zero_residual_points(new_x, new_x_task, new_y, coupling_dim, task_list):
 #     """Add deprecated auxiliary zero-residual training points."""
@@ -425,79 +567,6 @@ def convergence_dist(u_candidate: torch.Tensor, truth: torch.Tensor) -> torch.Te
     # print('u',u_candidate)
 
     return torch.linalg.norm(u_candidate - truth)
-
-
-def update_history_list(
-    dist_history, 
-    intersection_history, 
-    lsq_obj_history, 
-    trained_gp, 
-    input_list, 
-    truth_list):
-    """Append residual-intersection diagnostics to active-learning history.
-
-    Args:
-        dist_history: Mutable list of normalized coupling-space distances.
-        intersection_history: Tensor of previously computed full intersection
-            points.
-        trained_gp: Trained GP wrapper.
-        input_list: Iterable of fixed input vectors.
-        truth_list: Iterable of reference coupling solutions.
-
-    Returns:
-        Updated ``intersection_history`` tensor.
-    """
-
-    problem = trained_gp.problem
-    bounds = problem.bounds
-    input_dim = problem.input_dim
-
-    for input_vec, truth in zip(input_list, truth_list):
-        u_candidate, fun, std_ratio = residual_intersection(truth, input_vec, trained_gp)
-        x_candidate = torch.cat((input_vec, u_candidate))
-        dist = convergence_dist(
-            normalize(u_candidate, bounds[:, input_dim:]),
-            normalize(truth, bounds[:, input_dim:]),
-        )
-        dist_history.append(float(to_numpy(dist)))
-        intersection_history = torch.vstack((intersection_history, x_candidate))
-        lsq_obj_history.append(fun.item())
-
-    return intersection_history
-
-
-def residual_constraints(
-    x_coupling: torch.Tensor,
-    x_input: torch.Tensor,
-    y,
-    model,
-    problem,
-) -> torch.Tensor:
-    """
-    Return vector of unstandardized residual predictions.
-    Shape: (n_tasks,)
-    """
-
-    x = torch.hstack((x_input.unsqueeze(0), x_coupling))
-
-    residuals = []
-
-    for task_id, task in enumerate(problem.tasks):
-        x_task = torch.column_stack([x, tensor([task])])
-
-        posterior = model.posterior(
-            model.input_transform.untransform(x_task)
-        )
-
-        pred_mean = unstandardize(
-            posterior.mean,
-            y[task_id],
-            specify_mean=0.0,
-        )
-
-        residuals.append(pred_mean.squeeze())
-
-    return torch.stack(residuals)
 
 
 def residual_constraints_scipy(
