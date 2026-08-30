@@ -103,21 +103,21 @@ def active_learning_loop(
         try:
             estimated_bounds = _estimate_equilibrium_bounds(trained_gp)
     
-            # Expand bounds slightly about center by scale factor
-            bounds_center = estimated_bounds.mean(dim=0)
-            bounds_range = estimated_bounds.diff(dim=0)
-    
-            expanded_bounds = (
-                bounds_center + bounds_expansion_factor * tensor([[-1], [1]]) @ bounds_range / 2
-            )
-    
-            # Update the coupling-variable bounds
-            # problem.bounds[:, problem.input_dim:] = expanded_bounds
-            problem.set_bounds(expanded_bounds, range(-coupling_dim, 0))
-    
         except Exception as e:
             print(f"Bounds estimation failed: {e}.")
-            estimated_bounds = None
+            # Keep bounds the same
+            estimated_bounds = problem.bounds[:, -problem.coupling_dim:]
+
+        # Expand bounds slightly about center by scale factor
+        bounds_center = estimated_bounds.mean(dim=0)
+        bounds_range = estimated_bounds.diff(dim=0)
+
+        expanded_bounds = (
+            bounds_center + bounds_expansion_factor * tensor([[-1], [1]]) @ bounds_range / 2
+        )
+
+        # Update the coupling-variable bounds
+        problem.set_bounds(expanded_bounds, range(-coupling_dim, 0))
     
         return estimated_bounds
 
