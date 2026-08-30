@@ -772,7 +772,7 @@ def _estimate_equilibrium_bounds(
     # model,
     # problem,
     trained_gp,
-    n_samples: int = 64,
+    n_samples: int = 128,
     max_retries: int = 8,
     tol: float = 1e-6,
     acceptance_ratio: float = 0.6,
@@ -844,12 +844,12 @@ def _estimate_equilibrium_bounds(
         if np.isfinite(err) and err < tol and np.all(std_ratio < acceptance_ratio):
             intersections.append(res)
 
-    if len(intersections) > 0:
+    if len(intersections) > 1: # Do not use same point as LB and UB
         intersections = torch.stack(intersections)
-        # lb_estimate = intersections.amin(dim=0)
-        # ub_estimate = intersections.amax(dim=0)
-        lb_estimate = torch.quantile(intersections, 0.01, dim=0)
-        ub_estimate = torch.quantile(intersections, 0.99, dim=0)
+        lb_estimate = intersections.amin(dim=0)
+        ub_estimate = intersections.amax(dim=0)
+        # lb_estimate = torch.quantile(intersections, 0.01, dim=0)
+        # ub_estimate = torch.quantile(intersections, 0.99, dim=0)
         bounds_estimate = torch.vstack((lb_estimate, ub_estimate))
         return bounds_estimate
     else:
