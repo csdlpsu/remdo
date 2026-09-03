@@ -696,7 +696,12 @@ def residual_intersection(
         )
         best_result = result
         # residual_norm = np.linalg.norm(result.fun) # 2-norm
-        residual_norm = np.max(np.abs(result.fun)) # infinity norm
+        # residual_norm = np.max(np.abs(result.fun)) # infinity norm
+
+        coupling_range = to_numpy(
+            bounds[1, -coupling_dim:] - bounds[0, -coupling_dim:]
+        )
+        residual_norm = np.max(np.abs(result.fun/coupling_range)) # infinity norm
         best_error = residual_norm
 
     except Exception:
