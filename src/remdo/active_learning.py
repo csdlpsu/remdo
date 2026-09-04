@@ -232,6 +232,8 @@ def active_learning_loop(
                     .reshape(-1, ninputs, coupling_dim).swapaxes(0, 1),
                 "root_residual_history": np.array(history["root_residual_history"])
                     .reshape(-1, ninputs).swapaxes(0, 1),
+                "root_log": np.array(history["root_log"], dtype=object)
+                    .reshape(-1, ninputs).swapaxes(0, 1),
                 "bounds_history": torch.stack(history["bounds_history"])
                     .reshape(-1, 2, dim).cpu().numpy(),
                 "truth_list": history["truth_list"].cpu().numpy(),
@@ -363,6 +365,7 @@ def _initialize_history(save_hist, trained_gp):
         "std_ratio_history": [],
         "bounds_history": [],
         "root_residual_history": [],
+        "root_log": [],
     }
 
     update_history_list(history, trained_gp)
@@ -425,6 +428,7 @@ def update_history_list(history, trained_gp):
         history["intersection_history"].append(torch.cat((input_vec, u_candidate)))
         history["std_ratio_history"].append(std_ratio)
         history["root_residual_history"].append(fun.item())
+        history["root_log"].append(root_log)
 
     history["bounds_history"].append(trained_gp.problem.bounds.clone())
 
@@ -745,32 +749,41 @@ def residual_intersection(
     #     best_error,
     # )
 
-    intersection_full = torch.hstack((input_normalized, tensor(best_result.x)))
-    intersection_full_unnorm = model.input_transform.untransform(intersection_full)
-
-    stddev_ratio = []
+    if best_result is not None:
+        intersection_full = torch.hstack((input_normalized, tensor(best_result.x)))
+        intersection_full_unnorm = model.input_transform.untransform(intersection_full)
     
-    for task in trained_gp.problem.tasks:
-        # x = torch.atleast_2d(torch.cat((intersection_full, as_tensor([task]))))
-        x_unnorm = torch.atleast_2d(torch.cat((intersection_full_unnorm, as_tensor([task]))))
+        stddev_ratio = []
+        
+        for task in trained_gp.problem.tasks:
+            # x = torch.atleast_2d(torch.cat((intersection_full, as_tensor([task]))))
+            x_unnorm = torch.atleast_2d(torch.cat((intersection_full_unnorm, as_tensor([task]))))
+        
+            posterior = model.posterior(x_unnorm)
+            posterior_stddev = posterior.stddev.item()
+            # print(posterior.stddev)
+        
+            with prior_mode(True):
+                # prior_stddev = trained_gp.model(x).stddev.item()
+                # print(trained_gp.model(x).stddev)
+                prior_stddev = trained_gp.model(x_unnorm).stddev.item()
     
-        posterior = model.posterior(x_unnorm)
-        posterior_stddev = posterior.stddev.item()
-        # print(posterior.stddev)
+            stddev_ratio.append(posterior_stddev/prior_stddev)
     
-        with prior_mode(True):
-            # prior_stddev = trained_gp.model(x).stddev.item()
-            # print(trained_gp.model(x).stddev)
-            prior_stddev = trained_gp.model(x_unnorm).stddev.item()
+        return (
+            intersection_full_unnorm[input_dim:],
+            best_error,
+            np.array(stddev_ratio),
+            best_result,
+        )
 
-        stddev_ratio.append(posterior_stddev/prior_stddev)
-
-    return (
-        intersection_full_unnorm[input_dim:],
-        best_error,
-        np.array(stddev_ratio),
-        (best_result.success, best_result.message, best_result.maxcv,)
-    )
+    else:
+        return (
+            tensor(np.full(coupling_dim, np.nan)),
+            best_error,
+            np.full(len(trained_gp.problem.tasks), np.nan),
+            best_result,
+        )
 
 from scipy.stats import qmc
 
