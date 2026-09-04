@@ -160,7 +160,8 @@ def active_learning_loop(
             for per_task_y, per_task_new_y in zip(train_y, new_y)
         ]
 
-        train_y_standardized = [standardize(y, specify_mean=0.0) for y in train_y]
+        # train_y_standardized = [standardize(y, specify_mean=0.0) for y in train_y]
+        train_y_standardized = [standardize(y) for y in train_y]
         train_y_mt = torch.cat(train_y_standardized).reshape(-1, 1)
         train_x_mt = torch.vstack(train_x)
 
@@ -459,7 +460,7 @@ def residual_constraints(
         pred_mean = unstandardize(
             posterior.mean,
             y[task_id],
-            specify_mean=0.0,
+            # specify_mean=0.0,
         )
 
         residuals.append(pred_mean.squeeze())
@@ -524,7 +525,7 @@ def convergence_obj(
         pred_mean = unstandardize(
             posterior.mean,
             y[task_id],
-            specify_mean=0.0,
+            # specify_mean=0.0,
         )
         obj = obj + 0.5 * penalty_factor * pred_mean.square()
     return obj
@@ -640,8 +641,8 @@ def residual_intersection(
     u0: torch.Tensor,
     input_vec: torch.Tensor,
     trained_gp,
-    use_fallback: bool = False,
-    max_retries: int = 3,
+    # use_fallback: bool = False,
+    max_retries: int = 16,
     ftol: float = 1e-6,
 ) -> torch.Tensor:
     """Solve for coupling variables that minimize predicted residuals."""
@@ -679,37 +680,87 @@ def residual_intersection(
     residual_norm = np.inf
     best_error = np.inf
 
-    try:
-        result = root(
-            partial(
-                residual_constraints_scipy,
-                x_input=input_normalized,
-                y=y,
-                model=model,
-                problem=problem,
-            ),
-            to_numpy(u0_normalized),
-            jac=partial(
-                residual_constraints_jac_scipy,
-                x_input=input_normalized,
-                y=y,
-                model=model,
-                problem=problem,
-            ),
-            method="hybr",
-        )
-        best_result = result
-        # residual_norm = np.linalg.norm(result.fun) # 2-norm
-        # residual_norm = np.max(np.abs(result.fun)) # infinity norm
+    # try:
+    #     result = root(
+    #         partial(
+    #             residual_constraints_scipy,
+    #             x_input=input_normalized,
+    #             y=y,
+    #             model=model,
+    #             problem=problem,
+    #         ),
+    #         to_numpy(u0_normalized),
+    #         jac=partial(
+    #             residual_constraints_jac_scipy,
+    #             x_input=input_normalized,
+    #             y=y,
+    #             model=model,
+    #             problem=problem,
+    #         ),
+    #         method="hybr",
+    #     )
+    #     best_result = result
+    #     # residual_norm = np.linalg.norm(result.fun) # 2-norm
+    #     # residual_norm = np.max(np.abs(result.fun)) # infinity norm
 
-        coupling_range = to_numpy(
-            bounds[1, -coupling_dim:] - bounds[0, -coupling_dim:]
-        )
-        residual_norm = np.max(np.abs(best_result.fun/coupling_range)) # infinity norm
-        best_error = residual_norm
+    #     coupling_range = to_numpy(
+    #         bounds[1, -coupling_dim:] - bounds[0, -coupling_dim:]
+    #     )
+    #     residual_norm = np.max(np.abs(best_result.fun/coupling_range)) # infinity norm
+    #     best_error = residual_norm
 
-    except Exception:
-        result = None
+    # except Exception:
+    #     result = None
+
+    coupling_range = to_numpy(
+        bounds[1, -coupling_dim:] - bounds[0, -coupling_dim:]
+    )
+    
+    x0 = to_numpy(u0_normalized)
+    
+    for attempt in range(max_retries + 1):
+        try:
+            result = root(
+                partial(
+                    residual_constraints_scipy,
+                    x_input=input_normalized,
+                    y=y,
+                    model=model,
+                    problem=problem,
+                ),
+                x0,
+                jac=partial(
+                    residual_constraints_jac_scipy,
+                    x_input=input_normalized,
+                    y=y,
+                    model=model,
+                    problem=problem,
+                ),
+                method="hybr",
+            )
+    
+            residual_norm = np.max(
+                np.abs(result.fun / coupling_range)
+            )
+    
+            # keep best result seen so far
+            if residual_norm < best_error:
+                best_result = result
+                best_error = residual_norm
+    
+            # accept if root solver reports convergence
+            if result.success:
+                break
+    
+            # else:
+            #     print('root finding failed, retrying...')
+    
+        except Exception:
+            pass
+    
+        # random restart in normalized space [0, 1]^coupling_dim
+        x0 = np.random.rand(coupling_dim)
+
 
     # should_fallback = (
     #     use_fallback

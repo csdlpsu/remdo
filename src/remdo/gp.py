@@ -147,7 +147,8 @@ def train_multitask_gp(
 
     problem.set_vars(train_x)
     train_y = problem.res
-    train_y_mt = standardize(train_y, specify_mean=specify_mean).transpose(0, 1).reshape(-1, 1)
+    # train_y_mt = standardize(train_y, specify_mean=specify_mean).transpose(0, 1).reshape(-1, 1)
+    train_y_mt = standardize(train_y).transpose(0, 1).reshape(-1, 1)
 
     model = MultiTaskGP(
         train_x_mt,
