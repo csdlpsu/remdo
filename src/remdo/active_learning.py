@@ -416,7 +416,7 @@ def update_history_list(history, trained_gp):
         history["input_list"],
         history["truth_list"],
     ):
-        u_candidate, fun, std_ratio = residual_intersection(
+        u_candidate, fun, std_ratio, root_log = residual_intersection(
             truth,
             input_vec,
             trained_gp,
@@ -701,7 +701,7 @@ def residual_intersection(
         coupling_range = to_numpy(
             bounds[1, -coupling_dim:] - bounds[0, -coupling_dim:]
         )
-        residual_norm = np.max(np.abs(result.fun/coupling_range)) # infinity norm
+        residual_norm = np.max(np.abs(best_result.fun/coupling_range)) # infinity norm
         best_error = residual_norm
 
     except Exception:
@@ -769,6 +769,7 @@ def residual_intersection(
         intersection_full_unnorm[input_dim:],
         best_error,
         np.array(stddev_ratio),
+        (best_result.success, best_result.message, best_result.maxcv,)
     )
 
 from scipy.stats import qmc
@@ -823,7 +824,7 @@ def _estimate_equilibrium_bounds(
     for input_vec in input_sample:
         x0 = coupling_bounds.mean(dim=0) # center of coupling bounds
         for _ in range(max_retries+1):
-            res, err, std_ratio = residual_intersection(
+            res, err, std_ratio, _ = residual_intersection(
                 x0,
                 torch.as_tensor(
                     input_vec,
