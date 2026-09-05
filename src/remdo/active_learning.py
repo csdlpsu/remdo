@@ -54,6 +54,7 @@ def active_learning_loop(
     enable_bounds_refinement: bool = False,
     # bounds_refinement_frequency: int = 10,
     bounds_expansion_factor: float = 1.10,
+    variance_ratio: float = 0.5,
 ):
     """Run active learning for a trained multitask residual GP.
 
@@ -101,7 +102,7 @@ def active_learning_loop(
         problem = trained_gp.problem
     
         try:
-            estimated_bounds = _estimate_equilibrium_bounds(trained_gp)
+            estimated_bounds = _estimate_equilibrium_bounds(trained_gp, acceptance_ratio=(1-variance_ratio)**0.5)
     
         except Exception as e:
             print(f"Bounds estimation failed: {e}.")
