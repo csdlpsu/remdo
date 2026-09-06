@@ -97,12 +97,14 @@ def active_learning_loop(
 
     estimated_bounds = None
 
+    print('variance ratio', variance_ratio, 'acceptance ratio', ((1-variance_ratio)**0.5))
+
     def _update_bounds(trained_gp):
         """Estimate and update the equilibrium-set bounds."""
         problem = trained_gp.problem
     
         try:
-            estimated_bounds = _estimate_equilibrium_bounds(trained_gp, acceptance_ratio=(1-variance_ratio)**0.5)
+            estimated_bounds = _estimate_equilibrium_bounds(trained_gp, acceptance_ratio=((1-variance_ratio)**0.5))
     
         except Exception as e:
             print(f"Bounds estimation failed: {e}.")
@@ -897,7 +899,7 @@ def _estimate_equilibrium_bounds(
                     device=coupling_bounds.device,
                 ),
                 trained_gp,
-                use_fallback=False,
+                # use_fallback=False,
             )
 
             if not np.isfinite(err) or err >= tol:
