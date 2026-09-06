@@ -461,7 +461,7 @@ def residual_constraints(
         pred_mean = unstandardize(
             posterior.mean,
             y[task_id],
-            # specify_mean=0.0,
+            specify_mean=0.0,
         )
 
         residuals.append(pred_mean.squeeze())
