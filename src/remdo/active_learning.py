@@ -163,8 +163,8 @@ def active_learning_loop(
             for per_task_y, per_task_new_y in zip(train_y, new_y)
         ]
 
-        # train_y_standardized = [standardize(y, specify_mean=0.0) for y in train_y]
-        train_y_standardized = [standardize(y) for y in train_y]
+        train_y_standardized = [standardize(y, specify_mean=0.0) for y in train_y]
+        # train_y_standardized = [standardize(y) for y in train_y]
         train_y_mt = torch.cat(train_y_standardized).reshape(-1, 1)
         train_x_mt = torch.vstack(train_x)
 
@@ -437,39 +437,6 @@ def update_history_list(history, trained_gp):
     history["bounds_history"].append(trained_gp.problem.bounds.clone())
 
 
-def residual_constraints(
-    x_coupling: torch.Tensor,
-    x_input: torch.Tensor,
-    y,
-    model,
-    problem,
-) -> torch.Tensor:
-    """
-    Return vector of unstandardized residual predictions.
-    Shape: (n_tasks,)
-    """
-
-    x = torch.hstack((x_input.unsqueeze(0), x_coupling))
-
-    residuals = []
-
-    for task_id, task in enumerate(problem.tasks):
-        x_task = torch.column_stack([x, tensor([task])])
-
-        posterior = model.posterior(
-            model.input_transform.untransform(x_task)
-        )
-
-        pred_mean = unstandardize(
-            posterior.mean,
-            y[task_id],
-            specify_mean=0.0,
-        )
-
-        residuals.append(pred_mean.squeeze())
-
-    return torch.stack(residuals)
-
 # def _add_zero_residual_points(new_x, new_x_task, new_y, coupling_dim, task_list):
 #     """Add deprecated auxiliary zero-residual training points."""
 
@@ -519,25 +486,33 @@ def convergence_obj(
         Scalar tensor equal to the sum of squared unstandardized residual means.
     """
 
-    x = torch.hstack((x_input.unsqueeze(0), x_coupling))
-    obj = zeros(1, dtype=x.dtype, device=x.device)
+    x = torch.hstack((torch.atleast_2d(x_input), torch.atleast_2d(x_coupling)))
+    task_ids = torch.tensor(problem.tasks, dtype=x.dtype, device=x.device).unsqueeze(-1)
+    x_task = torch.cat(
+        (
+            x.expand(len(problem.tasks), -1),
+            task_ids,
+        ),
+        dim=1,
+    )
 
-    for task_id, task in enumerate(problem.tasks):
-        x_task = torch.column_stack([x, tensor([task])])
-        posterior = model.posterior(model.input_transform.untransform(x_task))
-        pred_mean = unstandardize(
-            posterior.mean,
-            y[task_id],
-            # specify_mean=0.0,
-        )
-        obj = obj + 0.5 * penalty_factor * pred_mean.square()
-    return obj
+    posterior = model.posterior(model.input_transform.untransform(x_task))
+
+    pred_mean = posterior.mean.squeeze(-1)
+    pred_mean = torch.stack(
+        [
+            unstandardize(pred_mean[i], y[i], specify_mean=0.0)
+            for i in range(len(problem.tasks))
+        ]
+    )
+
+    return 0.5 * penalty_factor * pred_mean.square().sum()
 
 
 def convergence_obj_scipy(x_coupling, x_input, y, model, problem):
     """NumPy-compatible wrapper around :func:`convergence_obj`."""
 
-    x_coupling_tens = tensor(x_coupling).unsqueeze(0)
+    x_coupling_tens = tensor(x_coupling)
     return to_numpy(convergence_obj(x_coupling_tens, x_input, y, model, problem).squeeze())
 
 
@@ -579,6 +554,73 @@ def convergence_dist(u_candidate: torch.Tensor, truth: torch.Tensor) -> torch.Te
     # print('u',u_candidate)
 
     return torch.linalg.norm(u_candidate - truth)
+
+
+def residual_constraints(
+    x_coupling: torch.Tensor,
+    x_input: torch.Tensor,
+    y,
+    model,
+    problem,
+) -> torch.Tensor:
+    """
+    Return vector of unstandardized residual predictions.
+    Shape: (n_tasks,)
+    """
+
+    x = torch.hstack((torch.atleast_2d(x_input), torch.atleast_2d(x_coupling)))
+
+    residuals = []
+
+    task_ids = torch.tensor(
+        problem.tasks,
+        device=x.device,
+        dtype=x.dtype,
+    ).unsqueeze(-1)
+
+    x_task = torch.cat(
+        (
+            x.expand(len(problem.tasks), -1),
+            task_ids,
+        ),
+        dim=1,
+    )
+
+    posterior = model.posterior(
+        model.input_transform.untransform(x_task)
+    )
+
+    pred_mean = posterior.mean.squeeze(-1)
+
+    residuals = torch.stack(
+        [
+            unstandardize(
+                pred_mean[i],
+                y[i],
+                specify_mean=0.0,
+            )
+            for i in range(len(problem.tasks))
+        ]
+    )
+
+    return residuals
+
+    # for task_id, task in enumerate(problem.tasks):
+    #     x_task = torch.column_stack([x, tensor([task])])
+
+    #     posterior = model.posterior(
+    #         model.input_transform.untransform(x_task)
+    #     )
+
+    #     pred_mean = unstandardize(
+    #         posterior.mean,
+    #         y[task_id],
+    #         specify_mean=0.0,
+    #     )
+
+    #     residuals.append(pred_mean.squeeze())
+
+    # return torch.stack(residuals)
 
 
 def residual_constraints_scipy(
@@ -645,8 +687,8 @@ def residual_intersection(
     input_vec: torch.Tensor,
     trained_gp,
     # use_fallback: bool = False,
-    max_retries: int = 16,
-    ftol: float = 1e-6,
+    max_retries: int = 8,
+    # ftol: float = 1e-4,
 ) -> torch.Tensor:
     """Solve for coupling variables that minimize predicted residuals."""
 
@@ -657,16 +699,6 @@ def residual_intersection(
     coupling_dim = problem.coupling_dim
     y = trained_gp.train_y
 
-    # u0 = torch.as_tensor(
-    #     u0,
-    #     dtype=bounds.dtype,
-    #     device=bounds.device,
-    # )
-    # input_vec = torch.as_tensor(
-    #     input_vec,
-    #     dtype=bounds.dtype,
-    #     device=bounds.device,
-    # )
     u0 = torch.as_tensor(u0)
     input_vec = torch.as_tensor(input_vec)
     
@@ -741,7 +773,7 @@ def residual_intersection(
                 ),
                 method="hybr",
             )
-    
+
             residual_norm = np.max(
                 np.abs(result.fun / coupling_range)
             )
@@ -763,45 +795,7 @@ def residual_intersection(
     
         # random restart in normalized space [0, 1]^coupling_dim
         x0 = np.random.rand(coupling_dim)
-
-
-    # should_fallback = (
-    #     use_fallback
-    #     and (
-    #         result is None
-    #         or not result.success
-    #         or residual_norm > ftol
-    #     )
-    # )
-
-    # if should_fallback:
-    #     coupling_bounds = Bounds(
-    #         torch.zeros(coupling_dim),
-    #         torch.ones(coupling_dim),
-    #     )
-    #     for retry in range(max_retries):
-    #         shgo_result = shgo(
-    #             convergence_obj_scipy,
-    #             coupling_bounds,
-    #             args=(input_normalized, y, model, problem),
-    #             n=128 * (2**retry),
-    #             sampling_method="sobol",
-    #         )
-
-    #         if (
-    #             best_result is None
-    #             or shgo_result.fun < best_error
-    #         ):
-    #             best_result = shgo_result
-    #             best_error = shgo_result.fun
-
-    #         if shgo_result.fun <= ftol:
-    #             break
-
-    # return (
-    #     unnormalize(tensor(best_result.x), bounds[:, input_dim:]),
-    #     best_error,
-    # )
+        # print('retrying...')
 
     if best_result is not None:
         intersection_full = torch.hstack((input_normalized, tensor(best_result.x)))
@@ -847,7 +841,7 @@ def _estimate_equilibrium_bounds(
     trained_gp,
     n_samples: int = 128,
     max_retries: int = 8,
-    tol: float = 1e-6,
+    tol: float = 1e-4,
     acceptance_ratio: float = 0.6,
 ) -> torch.Tensor:
     """Estimate the coupling-variable bounds of the equilibrium set.
