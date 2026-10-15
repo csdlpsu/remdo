@@ -8,7 +8,7 @@ from pathlib import Path
 import torch
 import numpy as np
 from botorch.fit import fit_gpytorch_mll
-from botorch.models import MultiTaskGP
+from botorch.models import MultiTaskGP, SingleTaskGP, ModelListGP
 from botorch.models.transforms import Normalize
 from botorch.utils.transforms import normalize, unnormalize
 from gpytorch.mlls import ExactMarginalLogLikelihood
@@ -20,7 +20,7 @@ from torch.autograd.functional import jacobian, hessian
 import warnings
 from botorch.exceptions.warnings import OptimizationWarning
 
-from .acquisition import _get_acq_func
+from .acquisition import _get_acq_func, _get_acq_func_modellist
 from .config import as_tensor, empty, tensor, to_numpy, zeros
 from .utils import standardize, unstandardize#, StratifiedStandardizeZeroMean
 
@@ -605,23 +605,6 @@ def residual_constraints(
 
     return residuals
 
-    # for task_id, task in enumerate(problem.tasks):
-    #     x_task = torch.column_stack([x, tensor([task])])
-
-    #     posterior = model.posterior(
-    #         model.input_transform.untransform(x_task)
-    #     )
-
-    #     pred_mean = unstandardize(
-    #         posterior.mean,
-    #         y[task_id],
-    #         specify_mean=0.0,
-    #     )
-
-    #     residuals.append(pred_mean.squeeze())
-
-    # return torch.stack(residuals)
-
 
 def residual_constraints_scipy(
     x_coupling,
@@ -714,38 +697,6 @@ def residual_intersection(
     best_result = None
     residual_norm = np.inf
     best_error = np.inf
-
-    # try:
-    #     result = root(
-    #         partial(
-    #             residual_constraints_scipy,
-    #             x_input=input_normalized,
-    #             y=y,
-    #             model=model,
-    #             problem=problem,
-    #         ),
-    #         to_numpy(u0_normalized),
-    #         jac=partial(
-    #             residual_constraints_jac_scipy,
-    #             x_input=input_normalized,
-    #             y=y,
-    #             model=model,
-    #             problem=problem,
-    #         ),
-    #         method="hybr",
-    #     )
-    #     best_result = result
-    #     # residual_norm = np.linalg.norm(result.fun) # 2-norm
-    #     # residual_norm = np.max(np.abs(result.fun)) # infinity norm
-
-    #     coupling_range = to_numpy(
-    #         bounds[1, -coupling_dim:] - bounds[0, -coupling_dim:]
-    #     )
-    #     residual_norm = np.max(np.abs(best_result.fun/coupling_range)) # infinity norm
-    #     best_error = residual_norm
-
-    # except Exception:
-    #     result = None
 
     coupling_range = to_numpy(
         bounds[1, -coupling_dim:] - bounds[0, -coupling_dim:]
@@ -924,3 +875,388 @@ def _estimate_equilibrium_bounds(
             f"Failed to find any equilibrium intersections after "
             f"{n_samples} samples and {max_retries} retries per sample."
         )
+
+
+from botorch.models.transforms import Standardize
+
+def active_learning_loop_modellist(
+    trained_gp,
+    acq_method: str | Callable,
+    maxiters: int = 20,
+    disp: bool = True,
+    save_hist: tuple[torch.Tensor, str, str] | None = None,
+):
+
+    model = trained_gp.model
+    train_x = trained_gp.train_x
+    train_y = trained_gp.train_y
+    problem = trained_gp.problem
+
+    task_list = list(problem.tasks)
+    dim = problem.dim
+    input_dim = problem.input_dim
+    coupling_dim = problem.coupling_dim
+    bounds = problem.bounds
+
+    if isinstance(acq_method, str):
+        acq_func = _get_acq_func_modellist(acq_method)
+    elif callable(acq_method):
+        acq_func = acq_method
+    else:
+        raise TypeError("acq_method must be a string or callable.")
+
+    history = None
+    if save_hist is not None:
+        history = _initialize_history_modellist(save_hist, trained_gp)
+
+    for iteration in range(maxiters):
+        if disp:
+            print(f"Iter {iteration + 1}")
+
+        new_x = [torch.atleast_2d(as_tensor(x)) for x in acq_func(model.models, problem)]
+        problem.set_vars(torch.vstack(new_x))
+
+        new_y = list(torch.diagonal(problem.res).unsqueeze(1))
+
+        train_x = torch.cat((train_x, torch.stack(new_x)[:,:]), dim=1)
+        train_y = torch.cat((train_y, torch.vstack(new_y)), dim=1)
+
+        # Update model
+        mods = []
+        import warnings
+
+        # Suppress all warnings inside this block
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            for ind, mod in enumerate(model.models):
+                newmodel = SingleTaskGP(
+                    torch.atleast_2d(train_x[ind, ...]),
+                    # torch.atleast_2d(train_y[ind, :]).transpose(0,1),
+                    standardize(train_y[ind, :].reshape(-1,1), specify_mean=0.0),
+                    input_transform=Normalize(d=dim, bounds=bounds),
+                    # outcome_transform=Standardize(m=1),
+                    outcome_transform=None,
+                )
+                mll = ExactMarginalLogLikelihood(newmodel.likelihood, newmodel)
+                fit_gpytorch_mll(mll)
+                
+                mods.append(newmodel)
+        
+        # After fitting or conditioning success, accept model
+        modellist = ModelListGP(*mods)
+        trained_gp.model = modellist
+        
+        # Update training sets
+        trained_gp.train_x = train_x
+        trained_gp.train_y = train_y
+
+        if history is not None:
+            update_history_list_modellist(history, trained_gp)
+
+    if disp:
+        print("done")
+
+    if history is not None:
+        ninputs = len(history["input_list"])
+        torch.save(
+            {
+                "num_evals": history["num_evals"],
+                "intersection_history": torch.stack(history["intersection_history"])
+                    .reshape(-1, ninputs, dim).transpose(0, 1).cpu().numpy(),
+                "std_ratio_history": np.stack(history["std_ratio_history"])
+                    .reshape(-1, ninputs, coupling_dim).swapaxes(0, 1),
+                "root_residual_history": np.array(history["root_residual_history"])
+                    .reshape(-1, ninputs).swapaxes(0, 1),
+                "root_log": np.array(history["root_log"], dtype=object)
+                    .reshape(-1, ninputs).swapaxes(0, 1),
+                "bounds_history": torch.stack(history["bounds_history"])
+                    .reshape(-1, 2, dim).cpu().numpy(),
+                "truth_list": history["truth_list"].cpu().numpy(),
+            },
+            history["filename"],
+        )
+
+    return trained_gp
+
+    return trained_gp
+
+
+def residual_constraints_modellist(
+    x_coupling: torch.Tensor,
+    x_input: torch.Tensor,
+    y,
+    modellist,
+    problem,
+) -> torch.Tensor:
+
+    x = torch.hstack((torch.atleast_2d(x_input), torch.atleast_2d(x_coupling)))
+
+    # posterior_list = [model.posterior(model.input_transform.untransform(x)) for model in modellist.models]
+    # mean_list = [posterior.mean.flatten()[0] for posterior in posterior_list]
+    # pred_mean = torch.stack(mean_list)
+    
+    pred_mean = torch.stack(
+        [
+            model.posterior(
+                model.input_transform.untransform(x)
+            ).mean.flatten()[0]
+            for model in modellist.models
+        ]
+    )
+
+    residuals = torch.stack(
+        [
+            unstandardize(
+                pred_mean[i],
+                y[i, ...],
+                specify_mean=0.0,
+            )
+            for i in range(len(problem.tasks))
+        ]
+    )
+
+    return residuals
+
+
+def residual_constraints_modellist_scipy(
+    x_coupling,
+    x_input,
+    y,
+    model,
+    problem,
+):
+    x_coupling_tens = tensor(x_coupling).unsqueeze(0)
+
+    return to_numpy(
+        residual_constraints_modellist(
+            x_coupling_tens,
+            x_input,
+            y,
+            model,
+            problem,
+        )
+    ).astype("float64")
+
+
+def residual_constraints_modellist_jac(
+    x_coupling: torch.Tensor,
+    x_input: torch.Tensor,
+    y,
+    model,
+    problem,
+):
+    def fun(xc):
+        return residual_constraints_modellist(
+            xc,
+            x_input,
+            y,
+            model,
+            problem,
+        )
+
+    return jacobian(fun, x_coupling).squeeze()
+
+
+def residual_constraints_modellist_jac_scipy(
+    x_coupling,
+    x_input,
+    y,
+    model,
+    problem,
+):
+    x_coupling_tens = tensor(x_coupling).unsqueeze(0)
+
+    return to_numpy(
+        residual_constraints_modellist_jac(
+            x_coupling_tens,
+            x_input,
+            y,
+            model,
+            problem,
+        )
+    ).astype("float64")
+    
+
+def residual_intersection_modellist(
+    u0: torch.Tensor,
+    input_vec: torch.Tensor,
+    trained_gp,
+    max_retries: int = 8,
+) -> torch.Tensor:
+
+    modellist = trained_gp.model
+    problem = trained_gp.problem
+    bounds = problem.bounds
+    input_dim = problem.input_dim
+    coupling_dim = problem.coupling_dim
+    y = trained_gp.train_y
+
+    u0 = torch.as_tensor(u0)
+    input_vec = torch.as_tensor(input_vec)
+    
+    x = torch.cat((input_vec, u0))
+    
+    normalized = modellist.models[0].input_transform(
+        x.unsqueeze(0)
+    ).squeeze(0)
+    
+    input_normalized = normalized[:input_dim]
+    u0_normalized = normalized[input_dim:]
+
+    best_result = None
+    residual_norm = np.inf
+    best_error = np.inf
+
+    coupling_range = to_numpy(
+        bounds[1, -coupling_dim:] - bounds[0, -coupling_dim:]
+    )
+    
+    x0 = to_numpy(u0_normalized)
+    
+    for attempt in range(max_retries + 1):
+        try:
+            result = root(
+                partial(
+                    residual_constraints_modellist_scipy,
+                    x_input=input_normalized,
+                    y=y,
+                    model=modellist,
+                    problem=problem,
+                ),
+                x0,
+                jac=partial(
+                    residual_constraints_modellist_jac_scipy,
+                    x_input=input_normalized,
+                    y=y,
+                    model=modellist,
+                    problem=problem,
+                ),
+                method="hybr",
+            )
+
+            residual_norm = np.max(
+                np.abs(result.fun / coupling_range)
+            )
+    
+            # keep best result seen so far
+            if residual_norm < best_error:
+                best_result = result
+                best_error = residual_norm
+    
+            # accept if root solver reports convergence
+            if result.success:
+                break
+    
+            # else:
+            #     print('root finding failed, retrying...')
+    
+        # except Exception:
+        #     pass
+        except Exception as e:
+            print(e)
+            pass
+    
+        # random restart in normalized space [0, 1]^coupling_dim
+        x0 = np.random.rand(coupling_dim)
+        # print('retrying...')
+
+    if best_result is not None:
+        intersection_full = torch.hstack((input_normalized, tensor(best_result.x)))
+        intersection_full_unnorm = modellist.models[0].input_transform.untransform(intersection_full).flatten()
+    
+        stddev_ratio = []
+        
+        for model in modellist.models:
+            x_unnorm = torch.atleast_2d(intersection_full_unnorm)
+        
+            posterior = model.posterior(x_unnorm)
+            posterior_stddev = posterior.stddev.item()
+        
+            with prior_mode(True):
+                # prior_stddev = trained_gp.model(x).stddev.item()
+                # print(trained_gp.model(x).stddev)
+                prior_stddev = model(x_unnorm).stddev.item()
+    
+            stddev_ratio.append(posterior_stddev/prior_stddev)
+    
+        return (
+            intersection_full_unnorm[input_dim:],
+            best_error,
+            np.array(stddev_ratio),
+            best_result,
+        )
+
+    else:
+        return (
+            tensor(np.full(coupling_dim, np.nan)),
+            best_error,
+            np.full(len(trained_gp.problem.tasks), np.nan),
+            best_result,
+        )
+
+def _initialize_history_modellist(save_hist, trained_gp):
+    """Prepare history-tracking state for active-learning diagnostics."""
+
+    problem = trained_gp.problem
+    input_dim = problem.input_dim
+    coupling_dim = problem.coupling_dim
+
+    input_list = as_tensor(save_hist[0]).reshape(-1, input_dim)
+    filename = save_hist[1]
+    truth_from = save_hist[2]
+
+    if truth_from == "openmdao":
+        truth_tensors = [
+            as_tensor(problem.from_OpenMDAO(input_vec))
+            for input_vec in input_list
+        ]
+
+        truth_list = (
+            torch.stack(truth_tensors)
+            if truth_tensors
+            else empty(0, coupling_dim)
+        )
+
+    elif truth_from == "specify":
+        truth_list = as_tensor(save_hist[3])
+
+    else:
+        raise ValueError("truth source must be 'openmdao' or 'specify'.")
+
+    history = {
+        "input_list": input_list,
+        "filename": filename,
+        "truth_list": truth_list,
+        "num_evals": [
+            sum(per_task_y.numel() for per_task_y in trained_gp.train_y)
+        ],
+        "intersection_history": [],
+        "std_ratio_history": [],
+        "bounds_history": [],
+        "root_residual_history": [],
+        "root_log": [],
+    }
+
+    update_history_list_modellist(history, trained_gp)
+
+    return history
+
+def update_history_list_modellist(history, trained_gp):
+    """Append residual-intersection diagnostics to active-learning history."""
+
+    for input_vec, truth in zip(
+        history["input_list"],
+        history["truth_list"],
+    ):
+        u_candidate, fun, std_ratio, root_log = residual_intersection_modellist(
+            truth,
+            input_vec,
+            trained_gp,
+        )
+
+        history["intersection_history"].append(torch.cat((input_vec, u_candidate)))
+        history["std_ratio_history"].append(std_ratio)
+        history["root_residual_history"].append(fun.item())
+        history["root_log"].append(root_log)
+
+    history["bounds_history"].append(trained_gp.problem.bounds.clone())

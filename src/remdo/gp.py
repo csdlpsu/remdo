@@ -7,7 +7,7 @@ from pathlib import Path
 import torch
 from botorch.fit import fit_gpytorch_mll
 from botorch.models.multitask import MultiTaskGP
-from botorch.models.transforms import Normalize
+from botorch.models.transforms import Normalize, Standardize
 from gpytorch.mlls import ExactMarginalLogLikelihood
 from scipy.stats import qmc
 
@@ -164,3 +164,123 @@ def train_multitask_gp(
         torch.save(model.state_dict(), save_hyperparams)
 
     return TrainedGP(problem, model, train_x_per_task, list(train_y.unbind(dim=1)))
+
+
+from botorch.models import ModelListGP, SingleTaskGP
+
+
+class TrainedModelListGP:
+    """
+    Container for a trained ModelListGP and associated data.
+    """
+
+    def __init__(self, problem=None, model=None, x=None, y=None):
+        self.problem = problem
+        self.model = model
+        self.train_x = x
+        self.train_y = y
+
+    def save(self, filename: str | Path) -> None:
+        """
+        Save model state and training data.
+        """
+
+        model_dict = {
+            "model_state_dict": self.model.state_dict(),
+            "problem_class": type(self.problem).__name__,
+            "train_x": self.train_x,
+            "train_y": self.train_y,
+            "num_models": len(self.model.models),
+        }
+
+        torch.save(model_dict, filename)
+
+    def load(self, filename: str | Path, map_location=None) -> None:
+        """
+        Load a saved ModelListGP.
+        """
+
+        model_dict = torch.load(
+            filename,
+            weights_only=False,
+            map_location=map_location or get_device(),
+        )
+
+        self.train_x = model_dict["train_x"]
+        self.train_y = model_dict["train_y"]
+
+        self.problem = PROBLEM_REGISTRY[
+            model_dict["problem_class"]
+        ]()
+
+        bounds = self.problem.bounds
+        dim = self.problem.dim
+
+        models = []
+
+        for x, y in zip(self.train_x, self.train_y):
+            model = SingleTaskGP(
+                train_X=x,
+                train_Y=y.unsqueeze(-1),
+                input_transform=Normalize(
+                    d=dim,
+                    bounds=bounds,
+                ),
+                outcome_transform=None,
+            )
+
+            models.append(model)
+
+        self.model = ModelListGP(*models)
+
+        self.model.load_state_dict(
+            model_dict["model_state_dict"]
+        )
+
+        self.model.eval()
+
+def train_modellist_gp(
+    problem,
+    num_train: int = 10,
+    seed: int | None = None,
+    disp: bool = True,
+) -> TrainedModelListGP:
+
+    del disp
+    bounds = problem.bounds
+    dim = problem.dim
+    task_list = list(problem.tasks)
+    num_tasks = len(task_list)
+    sampler = qmc.LatinHypercube(d=dim, seed=seed)
+
+    lower = bounds[0, :].detach().cpu().numpy()
+    upper = bounds[1, :].detach().cpu().numpy()
+    train_x = tensor(qmc.scale(sampler.random(n=num_train), lower, upper)) # num_train x dim tensor
+
+    problem.set_vars(train_x)
+    train_y = problem.res.transpose(0,1) # num_train x num_tasks tensor
+    
+    models = []
+
+    for ind, task in enumerate(task_list):
+        model = SingleTaskGP(
+            train_x,
+            # train_y[ind,:].unsqueeze(-1),
+            standardize(train_y[ind,:], specify_mean=0.0).unsqueeze(-1),
+            input_transform=Normalize(d=dim, bounds=bounds),
+            # outcome_transform=Standardize(m=1),
+            outcome_transform=None,
+        )
+        mll = ExactMarginalLogLikelihood(model.likelihood, model)
+        fit_gpytorch_mll(mll)
+
+        models.append(model)
+
+    modellist = ModelListGP(*models)
+    
+    return TrainedModelListGP(
+        problem, 
+        modellist, 
+        train_x.unsqueeze(0).tile(dims=(num_tasks,1,1)), # num_tasks x num_train x dim tensor
+        train_y
+    )

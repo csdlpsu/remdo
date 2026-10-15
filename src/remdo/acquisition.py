@@ -335,6 +335,33 @@ def multitask_acquisition(
 
     return func
 
+def modellist_acquisition(
+    acqf: AcquisitionFunction,
+    method: str,
+    constraints: list[dict] | Callable | None = None,
+) -> Callable:
+    def func(models, problem, disp: bool = False):
+        del disp
+    
+        if callable(constraints):
+            optimizer_constraints = constraints(model)
+        else:
+            optimizer_constraints = constraints
+    
+        return [
+            optimize_acquisition(
+                model,
+                problem,
+                acqf=acqf,
+                task_no=None,
+                method=method,
+                constraints=optimizer_constraints,
+            )[0]
+            for model in models
+        ]
+
+    return func
+
 
 def mean_acquisition(acqf: AcquisitionFunction, method: str) -> Callable:
     """Create an optimizer for the mean acquisition value across all tasks.
@@ -412,5 +439,13 @@ def _get_acq_func(acquisition_name: str) -> Callable:
         return multitask_acquisition(entropy, method="SLSQP", constraints=entropy_constraint)
     elif acquisition_name == "maxvar_constrained":
         return multitask_acquisition(variance, method="SLSQP", constraints=entropy_constraint)
+    else:
+        raise ValueError(f"Acquisition function '{acquisition_name}' undefined.")
+
+def _get_acq_func_modellist(acquisition_name: str) -> Callable:
+    if acquisition_name == "entropy":
+        return modellist_acquisition(entropy, method="L-BFGS-B")
+    elif acquisition_name == "random":
+        return random_acquisition()     
     else:
         raise ValueError(f"Acquisition function '{acquisition_name}' undefined.")
